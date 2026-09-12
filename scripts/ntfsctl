@@ -102,6 +102,30 @@ label_of() {
   ntfs_devices | awk -v d="$dev" '$1==d { sub(/^[^ ]+ /, ""); print; exit }'
 }
 
+# ---------- 挂载互斥锁（mkdir 原子锁，防守护进程与手动操作并发叠加挂载） ----------
+MOUNT_LOCK=/var/run/ntfsformac/mount.lock
+LOCK_TTL=30
+
+lock_mount() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if as_root mkdir "$MOUNT_LOCK" 2>/dev/null; then
+      return 0
+    fi
+    # 锁过期（进程崩溃残留）则强制接管
+    if [ -d "$MOUNT_LOCK" ] && [ $(( $(date +%s) - $(stat -f '%m' "$MOUNT_LOCK" 2>/dev/null || echo 0) )) -gt "$LOCK_TTL" ]; then
+      as_root rmdir "$MOUNT_LOCK" 2>/dev/null || true
+      continue
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+unlock_mount() {
+  as_root rmdir "$MOUNT_LOCK" 2>/dev/null || true
+}
+
 # ---------- 挂载 ----------
 mount_one() {
   local dev="$1" label owner uid gid ident parent mp line
@@ -111,6 +135,26 @@ mount_one() {
   [ -z "$label" ] && label="NTFS-${ident//\//_}"
   # label 含斜杠则兜底
   printf '%s' "$label" | grep -q '/' && label="NTFS-${ident//\//_}"
+  # diskutil 未探测出 NTFS 卷标时显示 NO NAME，此时挂载会留下错误挂载点，
+  # 等待重试，最多 10 秒（守护进程轮询也会处理）
+  if [ "$label" = "NO NAME" ] || [ -z "$label" ]; then
+    for i in 1 2 3 4 5; do
+      sleep 2
+      label=$(label_of "$dev")
+      [ -n "$label" ] && [ "$label" != "NO NAME" ] && break
+    done
+    [ -z "$label" ] && label="NTFS-${ident//\//_}"
+  fi
+
+  # 串行化挂载（守护进程与手动操作可能并发触发）
+  lock_mount || die "另一个挂载操作进行中，请稍后再试"
+  trap 'unlock_mount' EXIT
+
+  # 幂等：目标挂载点已有 FUSE-T rw 挂载则直接复用（守护进程可能已挂好）
+  if /sbin/mount 2>/dev/null | grep -qF "fuse-t:/$label on $MOUNT_ROOT/$label ("; then
+    log "已挂载读写: $label → $MOUNT_ROOT/$label"
+    unlock_mount; trap - EXIT; return 0
+  fi
 
   owner=$(resolve_owner)
   [ -n "$owner" ] || owner=$(id -un)
@@ -119,8 +163,9 @@ mount_one() {
 
   trace "mount_one dev=$dev label=$label owner=$owner uid=$uid gid=$gid"
 
-  # 1. 清理竞争者（FSKit 只读挂载 / 旧挂载），保留目标挂载点
-  unmount_competitors "$dev" "$label"
+  # 1. 清理竞争者（FSKit 只读挂载 / 旧挂载 / 守护进程抢挂的重复 FUSE-T），
+  #    挂载前全部卸载（含目标挂载点），避免同一挂载点叠加重复 NFS 挂载
+  unmount_competitors "$dev" "$label" 0
 
   # 2. 等 FSKit 释放设备
   sleep 3
@@ -139,9 +184,9 @@ mount_one() {
         -o "recover,noatime,uid=$uid,gid=$gid,volname=$label" || die "挂载 /dev/$ident 失败"
   fi
 
-  # 5. 挂载后再清一次竞争者（Tahoe FSKit 会反复尝试）
+  # 5. 挂载后再清一次竞争者（Tahoe FSKit 会反复尝试；跳过刚挂载的目标挂载点）
   sleep 1
-  unmount_competitors "$dev" "$label"
+  unmount_competitors "$dev" "$label" 1
 
   # 6. 关 Spotlight / fseventsd 防锁文件
   as_root mdutil -i off "$mp" >/dev/null 2>&1 || true
@@ -149,11 +194,14 @@ mount_one() {
   as_root touch "$mp/.fseventsd/no_log" >/dev/null 2>&1 || true
 
   log "已挂载读写: $label → $mp"
+  unlock_mount
+  trap - EXIT
 }
 
-# 清理某个设备的只读/僵尸挂载（保留目标挂载点上的 FUSE-T 挂载不碰）
+# 清理某个设备的只读/僵尸/重复挂载
+# $3 = skip_target: 1 表示保留目标挂载点上的 FUSE-T 挂载（挂载后清理用，避免误卸刚挂载的）
 unmount_competitors() {
-  local dev="$1" label="$2" target_mp="$MOUNT_ROOT/$label" line mp
+  local dev="$1" label="$2" skip_target="$3" target_mp="$MOUNT_ROOT/$label" line mp
   # 1) 同 /dev 的挂载（FSKit 只读寄生虫）：一律卸载，包括目标挂载点上的。
   #    注意 FUSE-T 挂载第一列是 "fuse-t:/<label>"，不会被这条匹配到，不会误删自己。
   /sbin/mount 2>/dev/null | grep -F "/dev/$dev on " | while IFS= read -r line; do
@@ -162,11 +210,11 @@ unmount_competitors() {
     trace "unmount competitor mp=$mp (by /dev)"
     as_root diskutil unmount force "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
   done
-  # 2) 同 label 的 FUSE-T 挂载（跳过目标挂载点，避免误卸自己刚挂载的）
+  # 2) 同 label 的 FUSE-T 挂载（守护进程/旧挂载可能已占目标挂载点，skip_target=0 时全卸防叠加）
   /sbin/mount 2>/dev/null | grep -F "fuse-t:/$label on " | while IFS= read -r line; do
     mp=$(mp_of_line "$line")
     [ -n "$mp" ] || continue
-    [ "$mp" = "$target_mp" ] && continue
+    [ "$skip_target" = "1" ] && [ "$mp" = "$target_mp" ] && continue
     trace "unmount competitor mp=$mp (by label)"
     as_root diskutil unmount force "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
   done
@@ -229,7 +277,7 @@ eject_one() {
 
   # 5. 弹出父盘
   if ! as_root diskutil eject "$parent" 2>/dev/null; then
-    unmount_competitors "$dev" "$label"
+    unmount_competitors "$dev" "$label" 1
     sleep 1
     as_root diskutil eject "$parent" 2>/dev/null || log "警告: diskutil eject $parent 失败，请手动弹出"
   fi

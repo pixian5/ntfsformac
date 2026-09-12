@@ -84,12 +84,24 @@ eject 时在 `/var/run/ntfsformac/ejecting.<dev>` 写标记，守护进程 60 �
 守护进程每 3 秒轮询，手动卸载后 state=none，下一轮立刻重挂读写，导致「卸载」无效。
 处理：unmount 时同样写 `ejecting.<dev>` 标记（60s TTL），尊重手动卸载意图；eject 是卸载+弹父盘，unmount 是只卸载不弹。
 
+### 15. 守护进程与手动挂载并发导致同一盘叠加多个 FUSE-T 挂载
+守护进程每 3 秒轮询，与用户手动 mount 并发时，两个 `ntfs-3g` 进程会先后挂到**同一个挂载点**（`/sbin/mount` 出现两行 `fuse-t:/<label> on ...`），同一 NTFS 设备多个写者，有损坏风险。
+产生条件：A 执行 `unmount_competitors` 时 B 还没挂上 → A 挂载成功 → B 随后也挂载成功，双方互不可见。
+处理三层：
+- 挂载互斥锁：`/var/run/ntfsformac/mount.lock`（mkdir 原子锁，30s TTL 防进程崩溃残留），守护进程与手动操作共用，串行化挂载；
+- 幂等检查：锁内先看目标挂载点是否已有 `fuse-t:/<label>` 挂载，有则直接复用返回；
+- `unmount_competitors` 增加 `skip_target` 参数：挂载前全卸（含目标挂载点），挂载后清理时跳过目标挂载点。
+
+### 16. 守护进程在卷标未探测到时抢挂到 /Volumes/NO NAME
+NTFS 盘刚插入、diskutil 还没读出 NTFS 卷标时，`diskutil list` 显示 `NO NAME`，守护进程可能挂到 `/Volumes/NO NAME` 留下垃圾挂载。
+处理：`mount_one` 里 label 为 `NO NAME`/空时等待重试（最多 10 秒），确认卷标后再挂载。
+
 ## 其它
 
-### 15. 测试镜像盘的坑
+### 17. 测试镜像盘的坑
 - `hdiutil create -size 512m -layout NONE xxx.img` 会生成 `xxx.img.dmg`，attach 时要带 `.dmg`。
 - `hdiutil attach -nomount` 可避免 macOS 自动挂载；`diskutil eject` 对磁盘镜像等价 detach。
 - 用镜像盘测试正好能复现 Tahoe 的 FSKit 只读自动挂载行为。
 
-### 16. macOS bash 是 3.2
+### 18. macOS bash 是 3.2
 无关联数组、无 `printf '%(...)T'`。脚本一律用空格字符串模拟集合、用 case 状态机。
