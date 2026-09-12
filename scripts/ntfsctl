@@ -1,0 +1,291 @@
+#!/bin/bash
+# ntfsctl — NTFS 读写控制 CLI（bash 3.2 兼容，macOS 自带 bash 无关联数组）
+# 用法:
+#   ntfsctl list [--porcelain]         列出 NTFS 盘及状态
+#   ntfsctl mount   <disk|label|all>   挂载为读写
+#   ntfsctl unmount <disk|label|all>   卸载（不弹出）
+#   ntfsctl eject   <disk|label|all>   安全弹出（先解挂 + SIGTERM ntfs-3g + diskutil eject）
+#   ntfsctl auto                       把所有 NTFS 挂为读写（daemon 调用）
+# 环境变量:
+#   NTFS_OWNER_USER  挂载属主（root 场景避免 uid=0）
+#   NTFS_MOUNT_DEBUG=1  输出 [trace] 调试信息
+
+NTFS_3G=/usr/local/bin/ntfs-3g
+MOUNT_ROOT=/Volumes
+MARKER_DIR=/var/run/ntfsformac
+MARKER_TTL=60
+DEBUG="${NTFS_MOUNT_DEBUG:-0}"
+
+trace() { [ "$DEBUG" = "1" ] && printf '[trace] %s\n' "$*" >&2; }
+die()   { printf '[ntfsctl] 错误: %s\n' "$*" >&2; exit 1; }
+log()   { printf '[ntfsctl] %s\n' "$*"; }
+
+# root 下直接执行，否则走 sudo（终端会提示密码）
+as_root() {
+  if [ "$(id -u)" = "0" ]; then "$@"; else sudo "$@"; fi
+}
+
+# ---------- 设备枚举：diskutil list → 每个 NTFS 设备 ----------
+# 输出: device|label（多行，仅 NTFS）
+# diskutil list 行格式: <#>: <TYPE> <NAME...> <SIZE> <IDENTIFIER>，NAME 可能含空格
+ntfs_devices() {
+  diskutil list 2>/dev/null | awk '
+    /\/dev\/disk/ { dev=$1 }
+    /Windows_NTFS/ {
+      ident=$NF
+      label=$3
+      for (i=4; i<=NF-3; i++) label=label " " $i
+      if (label ~ /^[+0-9.]*$|^MB$|^GB$|^TB$|^B$/) label=""
+      print ident, label
+    }
+    /Microsoft Basic Data/ {
+      ident=$NF
+      label=$5
+      for (i=6; i<=NF-3; i++) label=label " " $i
+      print ident, label
+    }
+  '
+}
+
+# 在 /sbin/mount 输出中查找设备或 FUSE-T 卷的挂载行。
+# 卷标/挂载点可能含空格，不能用 awk 按字段匹配，一律 grep -F 全行匹配。
+mount_line() {
+  local dev="$1" label="$2" line
+  line=$(/sbin/mount 2>/dev/null | grep -F "/dev/$dev on " | head -1)
+  [ -z "$line" ] && line=$(/sbin/mount 2>/dev/null | grep -F "fuse-t:/$label on " | head -1)
+  [ -z "$line" ] && line=$(/sbin/mount 2>/dev/null | grep -F " on /Volumes/$label (" | head -1)
+  printf '%s' "$line"
+}
+
+# 从挂载行提取挂载点（去掉 " on " 前缀与末尾 "(...)"）
+mp_of_line() {
+  printf '%s' "$1" | sed 's/^.* on //; s/ ([^)]*)$//'
+}
+
+# 由 /sbin/mount 解析某设备的挂载状态
+# 状态: rw / ro / none
+mount_state() {
+  local dev="$1" label="$2" line
+  line=$(mount_line "$dev" "$label")
+  [ -z "$line" ] && { echo "none"; return; }
+  if printf '%s' "$line" | grep -qE 'read-only|fskit'; then
+    echo "ro"
+  else
+    echo "rw"
+  fi
+}
+
+mountpoint_of() {
+  local dev="$1" label="$2" line
+  line=$(mount_line "$dev" "$label")
+  [ -z "$line" ] && return
+  mp_of_line "$line"
+}
+
+# ---------- 设备解析：disk|label|all → ident 列表 ----------
+resolve_devices() {
+  local target="$1" dev label
+  target="${target#/dev/}"   # 兼容 "disk4s1" 与 "/dev/disk4s1" 两种写法
+  [ "$target" = "all" ] && { ntfs_devices | awk '{print $1}'; return; }
+  if [ -b "/dev/$target" ]; then echo "$target"; return; fi
+  if printf '%s' "$target" | grep -qE '^disk[0-9]+(s[0-9]+)?$'; then echo "$target"; return; fi
+  # 按 label 匹配
+  ntfs_devices | while IFS=' ' read -r dev label; do
+    [ "$label" = "$target" ] && echo "$dev"
+  done
+  return 0
+}
+
+label_of() {
+  local dev="$1"
+  # label 可能含空格：去掉第一列设备名后整行输出
+  ntfs_devices | awk -v d="$dev" '$1==d { sub(/^[^ ]+ /, ""); print; exit }'
+}
+
+# ---------- 挂载 ----------
+mount_one() {
+  local dev="$1" label owner uid gid ident parent mp line
+  ident="$dev"
+  label=$(label_of "$dev")
+  # 无 label 兜底
+  [ -z "$label" ] && label="NTFS-${ident//\//_}"
+  # label 含斜杠则兜底
+  printf '%s' "$label" | grep -q '/' && label="NTFS-${ident//\//_}"
+
+  owner=$(resolve_owner)
+  [ -n "$owner" ] || owner=$(id -un)
+  uid=$(id -u "$owner" 2>/dev/null) || uid=501
+  gid=$(id -g "$owner" 2>/dev/null) || gid=20
+
+  trace "mount_one dev=$dev label=$label owner=$owner uid=$uid gid=$gid"
+
+  # 1. 清理竞争者（FSKit 只读挂载 / 旧挂载），保留目标挂载点
+  unmount_competitors "$dev" "$label"
+
+  # 2. 等 FSKit 释放设备
+  sleep 3
+  [ -e "/dev/$ident" ] || { sleep 3; [ -e "/dev/$ident" ] || die "设备 /dev/$ident 不存在（请重新插拔磁盘）"; }
+
+  # 3. 挂载点
+  mp="$MOUNT_ROOT/$label"
+  as_root mkdir -p "$mp" || die "创建挂载点 $mp 失败"
+
+  # 4. 挂载（FUSE-T + ntfs-3g）
+  if ! as_root "$NTFS_3G" "/dev/$ident" "$mp" \
+      -o "recover,noatime,uid=$uid,gid=$gid,volname=$label,local" 2>&1; then
+    # 尝试去掉 local（个别版本不支持）
+    log "mount 失败，重试（去掉 local 选项）..."
+    as_root "$NTFS_3G" "/dev/$ident" "$mp" \
+        -o "recover,noatime,uid=$uid,gid=$gid,volname=$label" || die "挂载 /dev/$ident 失败"
+  fi
+
+  # 5. 挂载后再清一次竞争者（Tahoe FSKit 会反复尝试）
+  sleep 1
+  unmount_competitors "$dev" "$label"
+
+  # 6. 关 Spotlight / fseventsd 防锁文件
+  as_root mdutil -i off "$mp" >/dev/null 2>&1 || true
+  as_root mkdir -p "$mp/.fseventsd" >/dev/null 2>&1 || true
+  as_root touch "$mp/.fseventsd/no_log" >/dev/null 2>&1 || true
+
+  log "已挂载读写: $label → $mp"
+}
+
+# 清理某个设备的只读/僵尸挂载（保留目标挂载点上的 FUSE-T 挂载不碰）
+unmount_competitors() {
+  local dev="$1" label="$2" target_mp="$MOUNT_ROOT/$label" line mp
+  # 1) 同 /dev 的挂载（FSKit 只读寄生虫）：一律卸载，包括目标挂载点上的。
+  #    注意 FUSE-T 挂载第一列是 "fuse-t:/<label>"，不会被这条匹配到，不会误删自己。
+  /sbin/mount 2>/dev/null | grep -F "/dev/$dev on " | while IFS= read -r line; do
+    mp=$(mp_of_line "$line")
+    [ -n "$mp" ] || continue
+    trace "unmount competitor mp=$mp (by /dev)"
+    as_root diskutil unmount force "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
+  done
+  # 2) 同 label 的 FUSE-T 挂载（跳过目标挂载点，避免误卸自己刚挂载的）
+  /sbin/mount 2>/dev/null | grep -F "fuse-t:/$label on " | while IFS= read -r line; do
+    mp=$(mp_of_line "$line")
+    [ -n "$mp" ] || continue
+    [ "$mp" = "$target_mp" ] && continue
+    trace "unmount competitor mp=$mp (by label)"
+    as_root diskutil unmount force "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
+  done
+}
+
+# ---------- 卸载 ----------
+unmount_one() {
+  local dev="$1" label mp
+  label=$(label_of "$dev")
+  mp=$(mountpoint_of "$dev" "$label")
+  if [ -z "$mp" ]; then log "未挂载: $dev"; return 0; fi
+  # 置挂起标记，防止 daemon 60s 内自动重挂（尊重手动卸载意图）
+  as_root mkdir -p "$MARKER_DIR" 2>/dev/null || true
+  as_root touch "$MARKER_DIR/ejecting.$dev" 2>/dev/null || true
+  if ! as_root diskutil unmount "$mp" 2>/dev/null; then
+    as_root umount -f "$mp" 2>/dev/null || die "卸载 $mp 失败"
+  fi
+  log "已卸载: $mp"
+}
+
+# ---------- 弹出 ----------
+eject_one() {
+  local dev="$1" label pid parent
+  label=$(label_of "$dev")
+  parent="${dev%s*}"
+  [ -z "$parent" ] && parent="$dev"
+  trace "eject_one dev=$dev label=$label parent=$parent"
+
+  # 1. eject marker（防 daemon 立即重挂）
+  as_root mkdir -p "$MARKER_DIR" 2>/dev/null || true
+  as_root touch "$MARKER_DIR/ejecting.$dev" 2>/dev/null || true
+
+  # 2. 按 label 精确解挂 FUSE-T 挂载（避免误伤其它盘；label 可能含空格，用 grep -F 全行匹配）
+  /sbin/mount 2>/dev/null | grep -F "fuse-t:/$label on " | while IFS= read -r line; do
+    mp=$(mp_of_line "$line")
+    [ -n "$mp" ] || continue
+    trace "eject: unmount $mp"
+    as_root diskutil unmount "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
+  done
+
+  # 3. 停掉该设备的 ntfs-3g 进程（先 SIGTERM 优雅退出，1s 后仍存活才 KILL）
+  pids=$(pgrep -f "ntfs-3g .*/dev/$dev" 2>/dev/null)
+  for pid in $pids; do
+    trace "eject: SIGTERM ntfs-3g pid=$pid"
+    as_root kill -TERM "$pid" 2>/dev/null || true
+  done
+  if [ -n "$pids" ]; then
+    sleep 1
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        trace "eject: ntfs-3g pid=$pid 未退出，强制结束"
+        as_root kill -9 "$pid" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  # 4. 清理空挂载点
+  mp="$MOUNT_ROOT/$label"
+  as_root rmdir "$mp" 2>/dev/null || true
+
+  # 5. 弹出父盘
+  if ! as_root diskutil eject "$parent" 2>/dev/null; then
+    unmount_competitors "$dev" "$label"
+    sleep 1
+    as_root diskutil eject "$parent" 2>/dev/null || log "警告: diskutil eject $parent 失败，请手动弹出"
+  fi
+  as_root rm -f "$MARKER_DIR/ejecting.$dev" 2>/dev/null || true
+  log "已弹出: $dev ($label)"
+}
+
+# ---------- 属主解析（root 挂载避免 uid=0） ----------
+resolve_owner() {
+  local owner
+  [ -n "${NTFS_OWNER_USER:-}" ] && { printf '%s' "$NTFS_OWNER_USER"; return; }
+  owner=$(stat -f '%Su' /dev/console 2>/dev/null)
+  [ -n "$owner" ] && [ "$owner" != "root" ] && { printf '%s' "$owner"; return; }
+  owner=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2>=501 && $2!="501" && $2+0>=501 {print $1; exit}')
+  [ -n "$owner" ] || owner=$(dscl . -list /Users UniqueID 2>/dev/null | awk '$2+0>=501 {print $1; exit}')
+  printf '%s' "$owner"
+}
+
+# ---------- 主流程 ----------
+CMD="${1:-list}"
+TARGET="${2:-all}"
+
+case "$CMD" in
+  list)
+    PORCELAIN=""
+    for a in "$@"; do [ "$a" = "--porcelain" ] && PORCELAIN=1; done
+    ntfs_devices | while IFS=' ' read -r dev label; do
+      [ -n "$dev" ] || continue
+      st=$(mount_state "$dev" "$label")
+      mp=$(mountpoint_of "$dev" "$label")
+      if [ -n "$PORCELAIN" ]; then
+        printf '%s|%s|ntfs|%s|%s\n' "$dev" "$label" "$mp" "$st"
+      else
+        printf '%-10s %-20s %-6s %s\n' "$dev" "$label" "$st" "$mp"
+      fi
+    done
+    ;;
+  mount|auto)
+    [ "$CMD" = "auto" ] && TARGET="all"
+    [ "$TARGET" = "all" ] && { [ -z "$(ntfs_devices)" ] && { log "没有检测到 NTFS 盘"; exit 0; }; }
+    for dev in $(resolve_devices "$TARGET"); do
+      mount_one "$dev"
+    done
+    ;;
+  unmount)
+    for dev in $(resolve_devices "$TARGET"); do
+      unmount_one "$dev"
+    done
+    ;;
+  eject)
+    for dev in $(resolve_devices "$TARGET"); do
+      eject_one "$dev"
+    done
+    ;;
+  *)
+    echo "用法: ntfsctl list|mount|unmount|eject [disk|label|all] [--porcelain]" >&2
+    exit 2
+    ;;
+esac

@@ -1,0 +1,18 @@
+# 构建产物
+build/
+*.dmg
+*.img
+*.img.dmg
+*.sparseimage
+
+# macOS
+.DS_Store
+
+# 测试临时文件
+/tmp/ntfs-test*
+test/*.log
+
+# Xcode
+*.xcodeproj
+xcuserdata/
+DerivedData/

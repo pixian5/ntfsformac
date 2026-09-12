@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.x.ntfsformac.automount</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/sbin/ntfs-automount.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>NTFS_OWNER_USER</key>
+		<string>__NTFS_OWNER_USER__</string>
+		<key>PATH</key>
+		<string>/usr/local/bin:/opt/homebrew/bin:/usr/sbin:/usr/bin:/sbin:/bin</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/ntfsformac-automount.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/ntfsformac-automount.log</string>
+</dict>
+</plist>
