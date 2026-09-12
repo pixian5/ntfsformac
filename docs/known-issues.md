@@ -105,3 +105,21 @@ NTFS 盘刚插入、diskutil 还没读出 NTFS 卷标时，`diskutil list` 显�
 
 ### 18. macOS bash 是 3.2
 无关联数组、无 `printf '%(...)T'`。脚本一律用空格字符串模拟集合、用 case 状态机。
+
+## Parallels 虚拟机联动（Windows 里测同一块 NTFS 盘）
+
+### 19. dmg → Parallels hdd 的两种转换
+- `prl_disk_tool create --hdd <x.hdd> --dmg <x.dmg>` 生成的是**引用式**磁盘（DiskDescriptor.xml 里 `Type=DMG File=/tmp/x.dmg` 直接指向 dmg），零拷贝，但 dmg/hdd 都不能移动或删除，否则虚拟机打不开。
+- 添加：`prlctl set "VM名" --device-add hdd --image /tmp/x.hdd --iface sata`，**添加后必须重启虚拟机**（热连接/热断开都会提示需要重启，`--device-connect/disconnect` 对运行中的 VM 无效）。
+- 验证 Windows 侧：`prlctl exec "VM名" powershell -NoProfile -Command "Get-Disk | Select Number,Size"`。
+
+### 20. Parallels 引用 dmg 时会锁文件，macOS 无法再读该镜像
+同一 dmg 被 Parallels 作为虚拟盘挂给 Windows 后，macOS 侧 `hdiutil attach -nomount` 虽能建出磁盘节点，但**分区表读不出来**（`diskutil list` 只见 GUID_partition_scheme、无分区），`hdiutil detach -force` 也报「资源忙」。
+处理：必须**停止虚拟机** → `prlctl set "VM名" --device-del hddX` 删除设备（运行中删不掉）→ 才能解锁 dmg 供 macOS 挂载。
+注意：Windows 里安全弹出 I: 只释放 guest 访问，Parallels 进程仍持锁，macOS 照样读不了。
+
+### 21. 同盘切系统使用 = 轮流独占
+同一个 dmg 里的 NTFS 卷不能 macOS（FUSE-T）与 Windows（Parallels）**同时**写，否则损坏。
+- 切给 Windows：macOS 先 `ntfsctl eject <dev>` → 重新添加 hdd 设备 → 重启虚拟机。
+- 切回 macOS：Windows 先安全弹出盘 → 停虚拟机删设备 → macOS attach + `ntfsctl mount`。
+- 数据互通验证：Windows 生成的 `$RECYCLE.BIN`、`System Volume Information` 在 macOS 挂载后可见；中文文件名在 cmd 里显示乱码是 GBK/UTF-8 编码问题，文件本身正常。
