@@ -67,11 +67,32 @@ ntfsctl eject disk4s1      # 安全弹出
 - macOS 没有完整 NTFS 修复工具；`ntfsfix` 只能回放日志。出现目录删不掉等 MFT 损坏，请接回 Windows 跑 `chkdsk /f`。
 - 遇到「Operation not permitted」读不到卷内容：系统设置 → 隐私与安全性 → 文件与文件夹 → 给相关 App 打开「网络宗卷」权限（FUSE-T 底层是 NFS）。
 
+## 当前开发进度
+
+核心功能已全部完成并验证：驱动安装、ntfsctl CLI、自动挂载守护进程、菜单栏 App（v0.0.4）、全量测试全绿、Parallels 联动测试。
+
+详情见 [docs/202609292309当前开发进度.md](docs/202609292309当前开发进度.md)。
+
+## 下一步待实现
+
+优先级最高的三件事：pkg 安装器、物理 U 盘压测、卸载脚本；另有开机自启、事件通知等 10 项规划。
+
+详情见 [docs/202609292309下一步待实现.md](docs/202609292309下一步待实现.md)。
+
 ## 开发
 
 - 版本号：`VERSION` 文件，`build-app.sh` 每次构建后 +0.0.1（满十进一）。
 - 测试（无需真实盘）：`bash test/test-ntfs-rw.sh`（推荐整脚本用管理员方式执行，一次授权跑完）。
-- 更多坑与经验见 [docs/known-issues.md](docs/known-issues.md)。
+
+## docs 文档索引
+
+| 文档 | 作用 |
+|---|---|
+| [project-analysis.md](docs/project-analysis.md) | 项目完整技术分析：架构、模块、设计决策、测试体系、限制 |
+| [known-issues.md](docs/known-issues.md) | 开发踩坑经验 21 条（FSKit 抢占、卷标解析、Parallels 锁文件等） |
+| [driver-install.md](docs/driver-install.md) | 驱动安装 / 重装 / 卸载手册 |
+| [202609292309当前开发进度.md](docs/202609292309当前开发进度.md) | 里程碑完成情况与当前功能清单 |
+| [202609292309下一步待实现.md](docs/202609292309下一步待实现.md) | 后续开发计划（P0/P1/P2 分级） |
 
 ## 许可
 
