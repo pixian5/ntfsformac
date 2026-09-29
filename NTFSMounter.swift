@@ -1,11 +1,13 @@
 import Cocoa
+import ServiceManagement
+import UserNotifications
 
 /// NTFSFormac 菜单栏 App
 /// 显示 NTFS 盘及读写状态，提供 挂载为读写 / 卸载 / 安全弹出 / 在 Finder 打开。
 /// 特权操作通过 sudo 免密提权（/etc/sudoers.d/ntfsformac），无需弹窗。
 @main
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
 
     static let ntfsctl = "/usr/local/bin/ntfsctl"
     static let driver = "/usr/local/bin/ntfs-3g"
@@ -29,6 +31,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var disks: [Disk] = []
     private var timer: Timer?
+    private var prevStates: [String: String] = [:]   // device -> state 上次快照（用于事件通知）
 
     // MARK: - 生命周期
 
@@ -39,6 +42,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 accessibilityDescription: "NTFS 工具")
         }
         statusItem = item
+
+        // 开机自启（macOS 13+ 官方 API；App 位于 /Applications 时才能注册成功）
+        if #available(macOS 13.0, *) {
+            try? SMAppService.mainApp.register()
+        }
+        // 挂载/卸载事件通知权限
+        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
 
         timer = Timer(timeInterval: 3, target: self, selector: #selector(refresh),
                       userInfo: nil, repeats: true)
@@ -61,8 +72,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 刷新
 
     @objc func refresh() {
+        let before = prevStates
         disks = listDisks()
+        var after: [String: String] = [:]
+        for d in disks { after[d.device] = d.state }
+        notifyChanges(before: before, after: after)
+        prevStates = after
+        updateIcon()
         buildMenu()
+    }
+
+    // MARK: - 事件通知（挂载/卸载）
+
+    private func notifyChanges(before: [String: String], after: [String: String]) {
+        for (dev, st) in after {
+            guard let old = before[dev] else { continue }
+            let label = disks.first(where: { $0.device == dev })?.label ?? dev
+            if old != "rw" && st == "rw" {
+                postNotification(title: "NTFS 已挂载", body: "\(label) 已挂载为读写")
+            } else if old == "rw" && st != "rw" {
+                postNotification(title: "NTFS 已卸载", body: "\(label) 已卸载")
+            }
+        }
+    }
+
+    private func postNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: UUID().uuidString,
+                                        content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+
+    // MARK: - 图标状态化（无盘 / 有盘未挂 / 有盘 rw）
+
+    private func updateIcon() {
+        guard let btn = statusItem?.button else { return }
+        if disks.isEmpty {
+            btn.image = NSImage(systemSymbolName: "externaldrive",
+                                accessibilityDescription: "NTFS 工具")
+        } else if disks.contains(where: { $0.state == "rw" }) {
+            btn.image = NSImage(systemSymbolName: "externaldrive.fill.badge.checkmark",
+                                accessibilityDescription: "NTFS 工具")
+        } else {
+            btn.image = NSImage(systemSymbolName: "externaldrive.badge.exclamationmark",
+                                accessibilityDescription: "NTFS 工具")
+        }
     }
 
     private func listDisks() -> [Disk] {
@@ -90,7 +153,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(header)
 
         let driverOK = FileManager.default.isExecutableFile(atPath: Self.driver)
-        let driverItem = NSMenuItem(title: driverOK ? "驱动：正常" : "驱动：未安装！", action: nil, keyEquivalent: "")
+        let ver = driverVersion()
+        let driverTitle = driverOK
+            ? "驱动：正常\(ver.isEmpty ? "" : " (ntfs-3g \(ver))")"
+            : "驱动：未安装！"
+        let driverItem = NSMenuItem(title: driverTitle, action: nil, keyEquivalent: "")
         driverItem.isEnabled = false
         menu.addItem(driverItem)
 
@@ -111,6 +178,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let rescan = NSMenuItem(title: "重新扫描", action: #selector(refresh), keyEquivalent: "r")
         rescan.target = self
         menu.addItem(rescan)
+
+        let check = NSMenuItem(title: "检查驱动更新", action: #selector(checkUpdate), keyEquivalent: "")
+        check.target = self
+        menu.addItem(check)
 
         let log = NSMenuItem(title: "打开自动挂载日志", action: #selector(openLog), keyEquivalent: "")
         log.target = self
@@ -214,6 +285,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         a.informativeText = text
         a.alertStyle = .warning
         a.runModal()
+    }
+
+    // MARK: - 驱动版本检查（本地 + 远端 GitHub release）
+
+    private func driverVersion() -> String {
+        let out = run("/usr/local/bin/ntfs-3g", ["--version"])
+        return out.split(separator: "\n").first.map {
+            String($0).trimmingCharacters(in: .whitespaces)
+        } ?? ""
+    }
+
+    @objc private func checkUpdate() {
+        Task { @MainActor in
+            let (latest, err) = await fetchLatestVersion()
+            if let latest {
+                let local = driverVersion()
+                if local.contains(latest) {
+                    alert("驱动更新检查", "ntfs-3g 已是最新版本（\(latest)）")
+                } else {
+                    alert("驱动更新检查",
+                          "本机 ntfs-3g：\(local)\nGitHub 最新：\(latest)\n\n升级方法：在终端运行 bash install-driver.sh（会重新构建安装）。")
+                }
+            } else {
+                alert("驱动更新检查", "查询失败：\(err ?? "网络不可用")")
+            }
+        }
+    }
+
+    private func fetchLatestVersion() async -> (String?, String?) {
+        let url = URL(string: "https://api.github.com/repos/macos-fuse-t/ntfs-3g/releases/latest")!
+        var req = URLRequest(url: url)
+        req.setValue("NTFSFormac/0.1", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                return (nil, "HTTP \(String(describing: (resp as? HTTPURLResponse)?.statusCode))")
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tag = json["tag_name"] as? String {
+                return (tag, nil)
+            }
+            return (nil, "解析失败")
+        } catch {
+            return (nil, error.localizedDescription)
+        }
     }
 
     // MARK: - 子进程
