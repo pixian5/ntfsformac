@@ -28,6 +28,22 @@ while true; do
     fi
   done
 
+  # 拔盘残留清理：FUSE-T 挂载的卷对应的设备节点已消失（盘被拔出/换盘）
+  # 注意：不能用 ntfsctl list 快照判断（diskutil 在 detach/抢占瞬间可能输出异常导致误判），
+  #       必须核对设备节点 /dev/diskXsY 是否真的不存在。
+  /sbin/mount 2>/dev/null | grep "fuse-t:/" | while IFS= read -r mline; do
+    mp=$(printf '%s' "$mline" | sed 's/^.* on //; s/ ([^)]*)$//')
+    [ -n "$mp" ] || continue
+    # 从 ntfs-3g 进程命令行提取该挂载点对应的设备节点（如 /dev/disk5s1）
+    dev=$(ps -axo command 2>/dev/null | grep "ntfs-3g " | grep -F " $mp" | head -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^\/dev\/disk/) print $i}')
+    # 无对应进程或设备节点仍在 → 正常挂载，跳过
+    [ -n "$dev" ] || continue
+    [ -e "$dev" ] && continue
+    log "检测到残留挂载（设备 $dev 已消失）: $mp，清理中"
+    diskutil unmount force "$mp" >/dev/null 2>&1 || umount -f "$mp" 2>/dev/null || true
+    rmdir "$mp" 2>/dev/null || true
+  done
+
   # 扫描
   "$NTFSCTL" list --porcelain 2>/dev/null | while IFS='|' read -r dev label fs mp state; do
     [ -n "$dev" ] || continue

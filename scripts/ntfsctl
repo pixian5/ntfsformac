@@ -175,11 +175,10 @@ mount_one() {
   mp="$MOUNT_ROOT/$label"
   as_root mkdir -p "$mp" || die "创建挂载点 $mp 失败"
 
-  # 4. 挂载（FUSE-T + ntfs-3g）
+  # 4. 挂载（FUSE-T + ntfs-3g；big_writes 提升大块写入性能，个别版本不支持则自动回退）
   if ! as_root "$NTFS_3G" "/dev/$ident" "$mp" \
-      -o "recover,noatime,uid=$uid,gid=$gid,volname=$label,local" 2>&1; then
-    # 尝试去掉 local（个别版本不支持）
-    log "mount 失败，重试（去掉 local 选项）..."
+      -o "recover,noatime,big_writes,uid=$uid,gid=$gid,volname=$label,local" 2>&1; then
+    log "mount 失败，去掉 big_writes/local 重试..."
     as_root "$NTFS_3G" "/dev/$ident" "$mp" \
         -o "recover,noatime,uid=$uid,gid=$gid,volname=$label" || die "挂载 /dev/$ident 失败"
   fi
