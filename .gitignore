@@ -16,3 +16,6 @@ test/*.log
 *.xcodeproj
 xcuserdata/
 DerivedData/
+
+# WorkBuddy 工作目录（项目记忆等，不入库）
+.workbuddy/
