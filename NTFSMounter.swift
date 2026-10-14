@@ -78,18 +78,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let before = prevStates
         disks = listDisks()
 
-        // BitLocker：若钥匙串里存过密码，则插入后自动解锁（每设备本会话只试一次，绝不弹窗）
+        // BitLocker：若钥匙串里存过凭据（用户密码 / 恢复密码 / .BEK 路径），插入后自动解锁
+        //（每设备本会话只试一次，绝不弹窗，也绝不猜密码）
         autoTried = autoTried.intersection(Set(disks.map { $0.device }))
         for d in disks where d.fs == "bitlocker" && d.state == "locked" {
             if autoTried.contains(d.device) { continue }
             autoTried.insert(d.device)
-            guard let pw = loadPassword(for: d.device) else { continue }
-            if unlockBitLocker(device: d.device, password: pw) {
+            guard let (method, cred) = loadCredential(for: d.device) else { continue }
+            // 记住的 .BEK 文件若已被移走就跳过并清除，避免无谓的失败提示
+            if method == .bekFile && !FileManager.default.fileExists(atPath: cred) {
+                forgetPassword(for: d.device)
+                continue
+            }
+            if unlockBitLocker(device: d.device, method: method, credential: cred) {
                 postNotification(title: "BitLocker 已自动解锁",
-                                 body: "\(d.label) 已用记住的密码解锁并挂载")
+                                 body: "\(d.label) 已用记住的凭据解锁并挂载")
             } else {
                 postNotification(title: "BitLocker 自动解锁失败",
-                                 body: "\(d.label)：保存的密码已失效，已清除（请手动解锁）")
+                                 body: "\(d.label)：保存的凭据已失效，已清除（请手动解锁）")
                 forgetPassword(for: d.device)
             }
             disks = listDisks()
@@ -237,11 +243,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let sub = NSMenu()
 
         if disk.fs == "bitlocker" && disk.state == "locked" {
-            // 加密卷未解锁：主操作是解锁（不猜密码，由用户输入）
-            let unlock = NSMenuItem(title: "解锁 BitLocker…", action: #selector(actionUnlockBL(_:)), keyEquivalent: "")
-            unlock.target = self
-            unlock.representedObject = disk
-            sub.addItem(unlock)
+            // 加密卷未解锁：提供三种凭据入口（用户密码 / 48 位恢复密码 / .BEK 恢复密钥文件）。
+            // 绝不猜密码，凭据一律由用户主动输入或选择文件。
+            let entries: [(String, Selector)] = [
+                ("用密码解锁…", #selector(actionUnlockBL(_:))),
+                ("用恢复密码解锁…", #selector(actionUnlockBLRecovery(_:))),
+                ("用 .BEK 文件解锁…", #selector(actionUnlockBLBEK(_:))),
+            ]
+            for (title, sel) in entries {
+                let it = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+                it.target = self
+                it.representedObject = disk
+                sub.addItem(it)
+            }
         } else if disk.state != "rw" {
             let mount = NSMenuItem(title: "挂载为读写", action: #selector(actionMount(_:)), keyEquivalent: "")
             mount.target = self
@@ -304,12 +318,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         refresh()
     }
 
-    // MARK: - BitLocker 解锁 / 锁定 / 密码记忆
+    // MARK: - BitLocker 解锁 / 锁定 / 凭据记忆
 
-    /// 弹窗输入 BitLocker 密码（可选「记住密码」存到登录钥匙串，下次插入自动解锁）
+    /// BitLocker 解锁凭据类型（对应 ntfsctl unlock 的不同参数）
+    private enum UnlockMethod {
+        case userPassword      // --password：用户设置的密码
+        case recoveryPassword  // --recovery：48 位数字恢复密码
+        case bekFile           // --bek：Windows 导出的 .BEK 恢复密钥文件
+    }
+
+    /// 把方法映射为钥匙串里的标记码
+    private func methodCode(_ method: UnlockMethod) -> String {
+        switch method {
+        case .userPassword:     return "u"
+        case .recoveryPassword: return "r"
+        case .bekFile:          return "b"
+        }
+    }
+
+    /// 弹窗输入 BitLocker 用户密码（可选「记住密码」存到登录钥匙串，下次插入自动解锁）
     private func promptBitLockerPassword(label: String) -> (String, Bool)? {
         let a = NSAlert()
-        a.messageText = "解锁 BitLocker：\(label)"
+        a.messageText = "用密码解锁 BitLocker：\(label)"
         a.informativeText = "请输入该加密卷的用户密码（大小写敏感）。密码只在本机使用，不会上传。"
         a.alertStyle = .informational
         a.addButton(withTitle: "解锁")
@@ -330,12 +360,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return (pw, remember.state == .on)
     }
 
+    /// 弹窗输入 48 位 BitLocker 恢复密码（连字符可带也可省略，ntfsctl 会规范化为 dislocker 要求的格式）
+    private func promptBitLockerRecovery(label: String) -> (String, Bool)? {
+        let a = NSAlert()
+        a.messageText = "用恢复密码解锁：\(label)"
+        a.informativeText = "请输入 48 位数字恢复密码（形如 123456-123456-…，连字符可省略）。"
+            + "可在 Windows 的 BitLocker 恢复密钥页面或 Microsoft 账户中查询。"
+        a.alertStyle = .informational
+        a.addButton(withTitle: "解锁")
+        a.addButton(withTitle: "取消")
+
+        let access = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 54))
+        let field = NSTextField(frame: NSRect(x: 0, y: 28, width: 380, height: 24))
+        field.placeholderString = "48 位恢复密码"
+        field.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)  // 等宽便于核对数字
+        let remember = NSButton(checkboxWithTitle: "记住恢复密码（下次插入自动解锁）", target: nil, action: nil)
+        remember.frame = NSRect(x: 0, y: 2, width: 380, height: 20)
+        access.addSubview(field)
+        access.addSubview(remember)
+        a.accessoryView = access
+
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !v.isEmpty else { return nil }
+        return (v, remember.state == .on)
+    }
+
+    /// 选择 Windows 导出的 .BEK 恢复密钥文件；返回文件路径（BEK 只是一份密钥文件，不做记忆）
+    private func promptBEKFile(label: String) -> String? {
+        let panel = NSOpenPanel()
+        panel.title = "选择 .BEK 恢复密钥文件"
+        panel.message = "解锁 \(label)：请选择 Windows 导出的 BitLocker 恢复密钥文件（*.BEK）"
+        panel.prompt = "选择"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        NSApp.activate(ignoringOtherApps: true)   // 菜单栏 App 需显式激活，面板才会弹到前台
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path
+    }
+
     @objc private func actionUnlockBL(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk else { return }
         guard let (pw, remember) = promptBitLockerPassword(label: d.label) else { return }
-        if unlockBitLocker(device: d.device, password: pw) {
-            if remember { savePassword(pw, for: d.device) }
+        if unlockBitLocker(device: d.device, method: .userPassword, credential: pw) {
+            if remember { saveCredential(pw, method: .userPassword, for: d.device) }
             postNotification(title: "BitLocker 已解锁", body: "\(d.label) 已解锁并挂载为读写")
+        }
+        refresh()
+    }
+
+    @objc private func actionUnlockBLRecovery(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? Disk else { return }
+        guard let (rec, remember) = promptBitLockerRecovery(label: d.label) else { return }
+        if unlockBitLocker(device: d.device, method: .recoveryPassword, credential: rec) {
+            if remember { saveCredential(rec, method: .recoveryPassword, for: d.device) }
+            postNotification(title: "BitLocker 已解锁", body: "\(d.label) 已用恢复密码解锁并挂载为读写")
+        }
+        refresh()
+    }
+
+    @objc private func actionUnlockBLBEK(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? Disk else { return }
+        guard let bek = promptBEKFile(label: d.label) else { return }
+        if unlockBitLocker(device: d.device, method: .bekFile, credential: bek) {
+            postNotification(title: "BitLocker 已解锁", body: "\(d.label) 已用 .BEK 恢复密钥解锁并挂载为读写")
         }
         refresh()
     }
@@ -349,38 +438,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc private func actionForgetBL(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk else { return }
         forgetPassword(for: d.device)
-        alert("已忘记密码", "已从钥匙串删除 \(d.label) 保存的密码。")
+        alert("已忘记凭据", "已从钥匙串删除 \(d.label) 保存的 BitLocker 凭据。")
         refresh()
     }
 
-    /// 解锁：密码写入 0600 临时文件后以 --password-file 传入，
-    /// 避免密码出现在进程参数（ps）中；用完立即删除。
-    private func unlockBitLocker(device: String, password: String) -> Bool {
-        let tmp = NSTemporaryDirectory() + "ntfsformac-bl-\(UUID().uuidString)"
-        do {
-            try password.write(toFile: tmp, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp)
-        } catch {
-            alert("解锁失败", "无法创建临时密码文件：\(error.localizedDescription)")
-            return false
+    /// 解锁统一入口。密码/恢复密码属敏感信息，先写入 0600 临时文件再以文件参数传入，
+    /// 避免出现在进程参数（ps）里；用完立即删除。.BEK 传的是文件路径，直接传参即可。
+    private func unlockBitLocker(device: String, method: UnlockMethod, credential: String) -> Bool {
+        switch method {
+        case .userPassword, .recoveryPassword:
+            let tmp = NSTemporaryDirectory() + "ntfsformac-bl-\(UUID().uuidString)"
+            do {
+                try credential.write(toFile: tmp, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp)
+            } catch {
+                alert("解锁失败", "无法创建临时凭据文件：\(error.localizedDescription)")
+                return false
+            }
+            defer { try? FileManager.default.removeItem(atPath: tmp) }
+            let flag = (method == .userPassword) ? "--password-file" : "--recovery-file"
+            return runAdmin(["unlock", device, flag, tmp])
+        case .bekFile:
+            return runAdmin(["unlock", device, "--bek", credential])
         }
-        defer { try? FileManager.default.removeItem(atPath: tmp) }
-        return runAdmin(["unlock", device, "--password-file", tmp])
     }
 
-    // MARK: - 钥匙串（BitLocker 密码记忆）
+    // MARK: - 钥匙串（BitLocker 凭据记忆）
 
-    private func savePassword(_ pw: String, for device: String) {
+    /// 记忆格式为 `<凭据>\n<方法码>`（u=用户密码 / r=恢复密码 / b=.BEK 路径）。
+    /// 方法码放在末尾，这样凭据本身含冒号或换行也不会被误解析。
+    private func saveCredential(_ credential: String, method: UnlockMethod, for device: String) {
         run("/usr/bin/security", ["delete-generic-password", "-s", keychainService, "-a", device])
-        run("/usr/bin/security", ["add-generic-password", "-s", keychainService, "-a", device, "-w", pw])
+        run("/usr/bin/security", ["add-generic-password", "-s", keychainService, "-a", device, "-w",
+                                  "\(credential)\n\(methodCode(method))"])
     }
 
-    private func loadPassword(for device: String) -> String? {
+    /// 读取已保存的凭据。旧版本保存的是纯密码（无方法码），按用户密码处理以兼容。
+    private func loadCredential(for device: String) -> (UnlockMethod, String)? {
         let (code, out) = runWithStatus("/usr/bin/security",
                                         ["find-generic-password", "-s", keychainService, "-a", device, "-w"])
         guard code == 0 else { return nil }
-        let pw = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return pw.isEmpty ? nil : pw
+        let v = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !v.isEmpty else { return nil }
+        if let nl = v.lastIndex(of: "\n") {
+            let cred = String(v[v.startIndex..<nl])
+            switch String(v[v.index(after: nl)...]) {
+            case "u": return cred.isEmpty ? nil : (.userPassword, cred)
+            case "r": return cred.isEmpty ? nil : (.recoveryPassword, cred)
+            case "b": return cred.isEmpty ? nil : (.bekFile, cred)
+            default:  break
+            }
+        }
+        return (.userPassword, v)
     }
 
     private func forgetPassword(for device: String) {

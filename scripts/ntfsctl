@@ -522,30 +522,46 @@ case "$CMD" in
   unlock)
     shift
     UT="${1:-all}"; shift 2>/dev/null || true
-    PW_FILE=""; PW=""; BEK=""; CLEARKEY=""
+    PW_FILE=""; PW=""; REC=""; REC_FILE=""; BEK=""; CLEARKEY=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --password-file) PW_FILE="${2:-}"; shift 2 ;;
         --password)      PW="${2:-}"; shift 2 ;;
+        --recovery-file) REC_FILE="${2:-}"; shift 2 ;;
+        --recovery)      REC="${2:-}"; shift 2 ;;
         --bek)           BEK="${2:-}"; shift 2 ;;
         --clearkey)      CLEARKEY=1; shift ;;
         --)              shift; break ;;
         *)               break ;;
       esac
     done
-    # 密码文件优先（避免密码出现在 ps/历史里）
+    # 凭据文件优先（避免密码/恢复密码出现在 ps 与 shell 历史里）
     if [ -n "$PW_FILE" ]; then
       [ -r "$PW_FILE" ] || die "无法读取密码文件 $PW_FILE"
       PW=$(cat "$PW_FILE")
     fi
+    if [ -n "$REC_FILE" ]; then
+      [ -r "$REC_FILE" ] || die "无法读取恢复密码文件 $REC_FILE"
+      REC=$(cat "$REC_FILE")
+    fi
+    # 恢复密码规范化：dislocker 严格要求 55 字符（48 位数字 + 7 个连字符，每 6 位一组，
+    # 见 dislocker 源码 accesses/rp/recovery_password.c 的 is_valid_key），
+    # 因此这里先剔除非数字字符，再按 6 位一组重新插入连字符。
+    if [ -n "$REC" ]; then
+      REC=$(printf '%s' "$REC" | tr -cd '0-9')
+      [ ${#REC} -eq 48 ] || die "恢复密码应为 48 位数字（可含连字符），当前 ${#REC} 位"
+      REC=$(printf '%s' "$REC" | sed -E 's/(.{6})(.{6})(.{6})(.{6})(.{6})(.{6})(.{6})(.{6})/\1-\2-\3-\4-\5-\6-\7-\8/')
+    fi
     if [ -n "$PW" ]; then
       set -- "-u$PW"                 # 用户密码；dislocker 内部会把 argv 里的密码抹成 X
+    elif [ -n "$REC" ]; then
+      set -- "-p$REC"                # 48 位恢复密码（recovery password）
     elif [ -n "$BEK" ]; then
       set -- "-f" "$BEK"             # USB 上的 .BEK 恢复密钥文件
     elif [ -n "$CLEARKEY" ]; then
       set -- "-c"                    # 明文密钥（无需密码，仅明文保护的卷）
     else
-      die "缺少解锁凭据：请用 --password / --password-file / --bek / --clearkey"
+      die "缺少解锁凭据：请用 --password / --password-file / --recovery / --recovery-file / --bek / --clearkey"
     fi
     for dev in $(resolve_devices "$UT"); do
       bl_unlock_one "$dev" "$@"
@@ -582,7 +598,9 @@ case "$CMD" in
   ntfsctl eject   <disk|label|all>           安全弹出
   ntfsctl lock    <disk|label|all>           重新锁定 BitLocker 卷并卸载
   ntfsctl unlock  <disk|label|all> <凭据>    解锁 BitLocker 并挂载读写
-     凭据: --password-file <路径> | --password <密码> | --bek <BEK文件> | --clearkey
+     凭据: --password-file <路径> | --password <密码>
+           --recovery-file <路径> | --recovery <48位恢复密码>
+           --bek <BEK文件> | --clearkey
   ntfsctl auto                               把所有盘挂为读写（daemon 调用）
 USAGE
     exit 2

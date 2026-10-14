@@ -5,6 +5,8 @@
 #   sudo bash test/test-bitlocker.sh
 #       → 自检（无需真实加密盘）：验证组件安装、签名检测、错误处理、资源清理
 #   sudo bash test/test-bitlocker.sh --device disk5s2 --password '密码'
+#   sudo bash test/test-bitlocker.sh --device disk5s2 --recovery '123456-...-123456'
+#   sudo bash test/test-bitlocker.sh --device disk5s2 --bek /path/XXXX.BEK
 #       → 真实 BitLocker 盘全流程：解锁 → 读写挂载 → 写文件校验 → 卸载 → 重新锁定 → 再解锁读回
 #
 # 建议整脚本以 root 运行（sudoers 已放行本脚本，免密）。
@@ -25,12 +27,15 @@ step(){ printf '\n== %s ==\n' "$*"; }
 
 [ "$(id -u)" = "0" ] || { echo "请以 root 运行：sudo bash $0"; exit 1; }
 
-DEV=""; PW=""; PW_FILE=""
+DEV=""; PW=""; PW_FILE=""; REC=""; REC_FILE=""; BEK=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --device)        DEV="${2:-}"; shift 2 ;;
     --password)      PW="${2:-}"; shift 2 ;;
     --password-file) PW_FILE="${2:-}"; shift 2 ;;
+    --recovery)      REC="${2:-}"; shift 2 ;;
+    --recovery-file) REC_FILE="${2:-}"; shift 2 ;;
+    --bek)           BEK="${2:-}"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -116,17 +121,26 @@ if [ -z "$DEV" ]; then
   step "5. 真实加密盘全流程 — 跳过（未提供 --device）"
   printf '    如需端到端验证：插入 BitLocker 加密盘后运行\n'
   printf '      sudo bash %s --device diskXsY --password ""你的密码""\n' "$0"
+  printf '      sudo bash %s --device diskXsY --recovery ""123456-...-123456""\n' "$0"
+  printf '      sudo bash %s --device diskXsY --bek /path/XXXX.BEK\n' "$0"
 else
   step "5. 真实加密盘全流程：$DEV"
   [ -n "$PW_FILE" ] && [ -r "$PW_FILE" ] && { PW=$(cat "$PW_FILE"); ok "从 $PW_FILE 读取密码"; }
-  [ -n "$PW" ] || { bad "缺少 --password / --password-file"; }
+  [ -n "$REC_FILE" ] && [ -r "$REC_FILE" ] && { REC=$(cat "$REC_FILE"); ok "从 $REC_FILE 读取恢复密码"; }
+  # 组装解锁凭据（用户密码优先，其次恢复密码，最后 BEK 文件）
+  CRED=()
+  if [ -n "$PW" ]; then CRED=(--password "$PW")
+  elif [ -n "$REC" ]; then CRED=(--recovery "$REC")
+  elif [ -n "$BEK" ]; then CRED=(--bek "$BEK")
+  else bad "缺少解锁凭据：--password / --password-file / --recovery / --recovery-file / --bek"
+  fi
 
   LINE=$("$NTFSCTL" list --porcelain | grep "^$DEV|" || true)
   printf '    list: %s\n' "$LINE"
   printf '%s' "$LINE" | grep -q '|bitlocker|' && ok "$DEV 是 BitLocker 卷" || bad "$DEV 不是 BitLocker 卷"
 
-  "$NTFSCTL" unlock "$DEV" --password "$PW" >/dev/null 2>&1 \
-    && ok "解锁成功" || bad "解锁失败"
+  [ ${#CRED[@]} -gt 0 ] && { "$NTFSCTL" unlock "$DEV" "${CRED[@]}" >/dev/null 2>&1 \
+    && ok "解锁成功" || bad "解锁失败"; }
 
   LABEL=$("$NTFSCTL" list --porcelain | grep "^$DEV|" | cut -d'|' -f2)
   MP="/Volumes/$LABEL"
@@ -149,7 +163,7 @@ else
   sleep 1
   pgrep -f "dislocker-fuse .*/dev/$DEV" >/dev/null && bad "锁定后仍有 dislocker-fuse 进程" || ok "锁定后无 dislocker-fuse 进程"
 
-  "$NTFSCTL" unlock "$DEV" --password "$PW" >/dev/null 2>&1 && ok "再次解锁" || bad "再次解锁失败"
+  "$NTFSCTL" unlock "$DEV" "${CRED[@]}" >/dev/null 2>&1 && ok "再次解锁" || bad "再次解锁失败"
   sleep 1
   if [ -f "$MP/bl-rw-test.txt" ]; then
     [ "$(cat "$MP/bl-rw-test.txt" 2>/dev/null)" = "bitlocker-rw-test" ] \

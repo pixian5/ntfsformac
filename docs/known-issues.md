@@ -163,3 +163,19 @@ sudoers 里写 `/bin/bash <脚本>` 时，调用 `/bin/bash <脚本> foo` **不�
   用 Python 把裸卷包进**标准 GPT 磁盘镜像**（分区类型 Microsoft Basic Data），即可呈现为 `diskXs1` 走完整流程。
 - 排错：Parallels 虚拟机盘是 Compressed 格式（`DiskDescriptor.xml` `Type=Compressed`）非裸盘，dislocker 读不了；
   picoCTF 的 bitlocker 镜像 CDN 已失效。
+
+### 27. dislocker 的恢复密码必须是 **55 字符**带连字符格式
+`dislocker -p` 走的 `is_valid_key()`（`src/accesses/rp/recovery_password.c`）第一件事就是
+`if(strlen(...) != 48+7)` 直接返回失败，之后按「6 位数字 + 1 个连字符」分组（`rp += 7`）逐块解析。
+因此**既不能只传 48 位纯数字，也不能带多余空格/换行**，必须传 `123456-123456-…`（48 位 + 7 个连字符）。
+- 现象：传纯数字会看到 `Error handling the recovery password: Wrong length (has to be 55)`；
+  传对格式但密钥错误时才是 `Unable to compute regions`。
+  这个差异可以用来**在不掌握真实密钥的情况下验证格式链路是否正确**。
+- 处理：ntfsctl `--recovery` 先 `tr -cd '0-9'` 只留数字 → 校验 48 位 → `sed` 按 6 位插回连字符，用户随便怎么粘都能用。
+
+### 28. 校验"字符串是否编进二进制"时别被 Swift 小字符串优化误导
+Swift 会把 **≤15 字节**的 UTF-8 字面量内联存储，不落在 `__TEXT,__cstring`，
+于是 `strings`/`grep` 完全找不到，容易误判"代码没编进去"。
+- 例：`用密码解锁…`(18 字节) 找得到；`--bek`(5 字节)、`已忘记凭据`(15 字节) 找不到。
+- 正确做法：用 Python 逐字节 `bytes.count(s.encode('utf-8'))` 统计，并明确"找不到 ≠ 没编进去"。
+  更可靠的等价验证是核对上游数据契约（如 `ntfsctl list --porcelain` 的字段数与含义）再做静态推理。
