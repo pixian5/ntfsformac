@@ -15,7 +15,7 @@ macOS 13 起移除了系统内置 NTFS 写入支持；macOS 26 上苹果的 FSKi
 │ NTFSMounter.app（Swift 菜单栏 App，用户态） │
 │  显示 NTFS 盘 + RW/RO 状态                 │
 │  挂载为读写 / 卸载 / 安全弹出 / 在 Finder 打开│
-│  特权操作 = osascript 管理员弹窗            │
+│  特权操作 = sudo 免密（ntfsctl，无授权框）  │
 └───────────────┬────────────────────────────┘
                 │ ntfsctl list --porcelain
 ┌───────────────┴────────────────────────────┐
@@ -27,6 +27,12 @@ macOS 13 起移除了系统内置 NTFS 写入支持；macOS 26 上苹果的 FSKi
 ┌───────────────┴────────────────────────────┐
 │ /usr/local/bin/ntfs-3g（macos-fuse-t 分支） │
 │  ← 链接 libfuse-t（FUSE-T 运行时）          │
+└───────────────┬────────────────────────────┘
+   BitLocker 加密卷时 ntfs-3g 挂的是解密后的虚拟卷：
+   /dev/diskN ──dislocker-fuse──▶ <容器>/dislocker-file ──ntfs-3g──▶ /Volumes/<卷标>
+┌────────────────────────────────────────────┐
+│ /usr/local/bin/dislocker-fuse（v0.7.3）     │
+│  解锁 BitLocker：用户密码/恢复密码/BEK       │
 └────────────────────────────────────────────┘
 ┌────────────────────────────────────────────┐
 │ LaunchDaemon com.x.ntfsformac.automount    │
@@ -52,12 +58,16 @@ bash build-app.sh
 
 - 插入 NTFS 盘后 5~10 秒自动挂载为读写，出现在 `/Volumes/<卷标>`，菜单栏图标显示状态。
 - 菜单栏点开：每个盘可「挂载为读写 / 卸载 / 安全弹出 / 在 Finder 中打开」。
+- **BitLocker 加密盘**：自动挂载只标记 🔒「加密未解锁」并跳过（**绝不猜密码**）。点菜单栏「解锁 BitLocker…」输入密码后
+  即读写挂载；勾选「记住密码」会存入钥匙串，下次插入自动解锁。也有「重新锁定」「忘记已保存的密码」。
 - 命令行（可选）：
 
 ```bash
-ntfsctl list --porcelain   # device|label|ntfs|mountpoint|rw|ro|none
+ntfsctl list --porcelain   # device|label|<ntfs|bitlocker>|mountpoint|<rw|ro|none|locked>
 ntfsctl mount disk4s1      # 挂载读写（按设备或卷标或 all）
 ntfsctl eject disk4s1      # 安全弹出
+ntfsctl unlock disk4s1 --password-file /path/pw   # 解锁 BitLocker 并挂载读写
+ntfsctl lock disk4s1       # 重新锁定 BitLocker（卸载 + 停止解密）
 ```
 
 ## ⚠ 注意事项
@@ -69,20 +79,23 @@ ntfsctl eject disk4s1      # 安全弹出
 
 ## 当前开发进度
 
-核心功能已全部完成并验证：驱动安装、ntfsctl CLI、自动挂载守护进程、菜单栏 App（v0.0.4）、全量测试全绿、Parallels 联动测试。
+NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
+菜单栏 App（v0.0.8）、BitLocker 解锁/读写/重新锁定 + 钥匙串自动解锁、全量测试全绿。
+BitLocker 真实加密盘端到端 29 项全绿。
 
-详情见 [docs/20260929-2309-当前开发进度-未标注.md](docs/20260929-2309-当前开发进度-未标注.md)。
+详情见 [docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md)。
 
 ## 下一步待实现
 
-优先级最高的三件事：pkg 安装器、物理 U 盘压测、卸载脚本；另有开机自启、事件通知等 10 项规划。
+优先级最高的三件事：物理 BitLocker 盘压测、卸载脚本、pkg 安装器；另有恢复密码/BEK 入口、开机自启等 10 项规划。
 
-详情见 [docs/20260929-2309-下一步待实现-未标注.md](docs/20260929-2309-下一步待实现-未标注.md)。
+详情见 [docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md)。
 
 ## 开发
 
-- 版本号：`VERSION` 文件，`build-app.sh` 每次构建后 +0.0.1（满十进一）。
+- 版本号：`VERSION` 文件，`build-app.sh` 每次构建前 +0.0.1（满十进一）。
 - 测试（无需真实盘）：`bash test/test-ntfs-rw.sh`（推荐整脚本用管理员方式执行，一次授权跑完）。
+- BitLocker 测试（无需真实盘）：`bash test/test-bitlocker.sh`（自检 17 项）；接真实加密盘再加 `--device diskXsY --password '密码'`。
 
 ## docs 文档索引
 
@@ -91,10 +104,11 @@ ntfsctl eject disk4s1      # 安全弹出
 | 文档 | 作用 |
 |---|---|
 | [project-analysis.md](docs/project-analysis.md) | 项目完整技术分析：架构、模块、设计决策、测试体系、限制 |
-| [known-issues.md](docs/known-issues.md) | 开发踩坑经验 21 条（FSKit 抢占、卷标解析、Parallels 锁文件等） |
+| [known-issues.md](docs/known-issues.md) | 开发踩坑经验（FSKit 抢占、卷标解析、Parallels 锁文件、FUSE-T 就绪窗口等） |
 | [driver-install.md](docs/driver-install.md) | 驱动安装 / 重装 / 卸载手册 |
-| [20260929-2309-当前开发进度-未标注.md](docs/20260929-2309-当前开发进度-未标注.md) | 里程碑完成情况与当前功能清单 |
-| [20260929-2309-下一步待实现-未标注.md](docs/20260929-2309-下一步待实现-未标注.md) | 后续开发计划（P0/P1/P2 分级） |
+| [20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md](docs/20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md) | BitLocker 解锁/读写方案与验证全过程 |
+| [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
+| [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划（P0/P1/P2 分级） |
 
 ## 许可
 

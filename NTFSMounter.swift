@@ -24,14 +24,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     struct Disk: Equatable {
         var device: String
         var label: String
+        var fs: String         // ntfs / bitlocker
         var mountPoint: String
-        var state: String   // rw / ro / none
+        var state: String      // rw / ro / none / locked
     }
 
     private var statusItem: NSStatusItem?
     private var disks: [Disk] = []
     private var timer: Timer?
     private var prevStates: [String: String] = [:]   // device -> state 上次快照（用于事件通知）
+    private var autoTried: Set<String> = []          // 本会话已尝试过自动解锁的设备（避免反复试探）
+    private let keychainService = "NTFSFormac"       // 钥匙串条目 service 名（BitLocker 密码记忆）
 
     // MARK: - 生命周期
 
@@ -74,6 +77,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @objc func refresh() {
         let before = prevStates
         disks = listDisks()
+
+        // BitLocker：若钥匙串里存过密码，则插入后自动解锁（每设备本会话只试一次，绝不弹窗）
+        autoTried = autoTried.intersection(Set(disks.map { $0.device }))
+        for d in disks where d.fs == "bitlocker" && d.state == "locked" {
+            if autoTried.contains(d.device) { continue }
+            autoTried.insert(d.device)
+            guard let pw = loadPassword(for: d.device) else { continue }
+            if unlockBitLocker(device: d.device, password: pw) {
+                postNotification(title: "BitLocker 已自动解锁",
+                                 body: "\(d.label) 已用记住的密码解锁并挂载")
+            } else {
+                postNotification(title: "BitLocker 自动解锁失败",
+                                 body: "\(d.label)：保存的密码已失效，已清除（请手动解锁）")
+                forgetPassword(for: d.device)
+            }
+            disks = listDisks()
+            break
+        }
+
         var after: [String: String] = [:]
         for d in disks { after[d.device] = d.state }
         notifyChanges(before: before, after: after)
@@ -116,11 +138,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func updateIcon() {
         guard let btn = statusItem?.button else { return }
-        if disks.isEmpty {
-            btn.image = NSImage(systemSymbolName: "externaldrive",
-                                accessibilityDescription: "NTFS 工具")
-        } else if disks.contains(where: { $0.state == "rw" }) {
+        if disks.contains(where: { $0.state == "rw" }) {
             btn.image = NSImage(systemSymbolName: "externaldrive.fill.badge.checkmark",
+                                accessibilityDescription: "NTFS 工具")
+        } else if disks.contains(where: { $0.state == "locked" }) {
+            // 有 BitLocker 加密盘等待解锁
+            btn.image = NSImage(systemSymbolName: "lock.fill",
+                                accessibilityDescription: "NTFS 工具（有加密盘待解锁）")
+        } else if disks.isEmpty {
+            btn.image = NSImage(systemSymbolName: "externaldrive",
                                 accessibilityDescription: "NTFS 工具")
         } else {
             btn.image = NSImage(systemSymbolName: "externaldrive.badge.exclamationmark",
@@ -129,13 +155,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func listDisks() -> [Disk] {
-        let out = run(Self.ntfsctl, ["list", "--porcelain"])
+        // 必须以 root 运行：BitLocker 签名检测需要读取裸设备首扇区，
+        // 真实磁盘设备节点属主是 root:operator，普通用户无权读。
+        let out = run("/usr/bin/sudo", ["-n", Self.ntfsctl, "list", "--porcelain"])
         var result: [Disk] = []
         for line in out.split(separator: "\n") {
             let f = line.split(separator: "|", omittingEmptySubsequences: false)
             guard f.count >= 5 else { continue }
             result.append(Disk(device: String(f[0]),
                                label: String(f[1]),
+                               fs: String(f[2]),
                                mountPoint: String(f[3]),
                                state: String(f[4])))
         }
@@ -197,11 +226,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func makeDiskItem(_ disk: Disk) -> NSMenuItem {
-        let tag = disk.state == "rw" ? "● RW" : (disk.state == "ro" ? "○ RO" : "○ 未挂载")
+        let tag: String
+        switch disk.state {
+        case "rw":     tag = "● RW"
+        case "ro":     tag = "○ RO"
+        case "locked": tag = "○ 加密未解锁"
+        default:       tag = "○ 未挂载"
+        }
         let item = NSMenuItem(title: "\(disk.label)  [\(tag)]", action: nil, keyEquivalent: "")
         let sub = NSMenu()
 
-        if disk.state != "rw" {
+        if disk.fs == "bitlocker" && disk.state == "locked" {
+            // 加密卷未解锁：主操作是解锁（不猜密码，由用户输入）
+            let unlock = NSMenuItem(title: "解锁 BitLocker…", action: #selector(actionUnlockBL(_:)), keyEquivalent: "")
+            unlock.target = self
+            unlock.representedObject = disk
+            sub.addItem(unlock)
+        } else if disk.state != "rw" {
             let mount = NSMenuItem(title: "挂载为读写", action: #selector(actionMount(_:)), keyEquivalent: "")
             mount.target = self
             mount.representedObject = disk
@@ -213,6 +254,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             open.target = self
             open.representedObject = disk
             sub.addItem(open)
+        }
+
+        if disk.fs == "bitlocker" && disk.state != "locked" {
+            let lock = NSMenuItem(title: "重新锁定 BitLocker", action: #selector(actionLockBL(_:)), keyEquivalent: "")
+            lock.target = self
+            lock.representedObject = disk
+            sub.addItem(lock)
+        }
+
+        if disk.fs == "bitlocker" {
+            let forget = NSMenuItem(title: "忘记已保存的密码", action: #selector(actionForgetBL(_:)), keyEquivalent: "")
+            forget.target = self
+            forget.representedObject = disk
+            sub.addItem(forget)
         }
 
         let unmount = NSMenuItem(title: "卸载", action: #selector(actionUnmount(_:)), keyEquivalent: "")
@@ -249,6 +304,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         refresh()
     }
 
+    // MARK: - BitLocker 解锁 / 锁定 / 密码记忆
+
+    /// 弹窗输入 BitLocker 密码（可选「记住密码」存到登录钥匙串，下次插入自动解锁）
+    private func promptBitLockerPassword(label: String) -> (String, Bool)? {
+        let a = NSAlert()
+        a.messageText = "解锁 BitLocker：\(label)"
+        a.informativeText = "请输入该加密卷的用户密码（大小写敏感）。密码只在本机使用，不会上传。"
+        a.alertStyle = .informational
+        a.addButton(withTitle: "解锁")
+        a.addButton(withTitle: "取消")
+
+        let access = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 28, width: 320, height: 24))
+        field.placeholderString = "BitLocker 密码"
+        let remember = NSButton(checkboxWithTitle: "记住密码（下次插入自动解锁）", target: nil, action: nil)
+        remember.frame = NSRect(x: 0, y: 2, width: 320, height: 20)
+        access.addSubview(field)
+        access.addSubview(remember)
+        a.accessoryView = access
+
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        let pw = field.stringValue
+        guard !pw.isEmpty else { return nil }
+        return (pw, remember.state == .on)
+    }
+
+    @objc private func actionUnlockBL(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? Disk else { return }
+        guard let (pw, remember) = promptBitLockerPassword(label: d.label) else { return }
+        if unlockBitLocker(device: d.device, password: pw) {
+            if remember { savePassword(pw, for: d.device) }
+            postNotification(title: "BitLocker 已解锁", body: "\(d.label) 已解锁并挂载为读写")
+        }
+        refresh()
+    }
+
+    @objc private func actionLockBL(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? Disk else { return }
+        runAdmin(["lock", d.device])
+        refresh()
+    }
+
+    @objc private func actionForgetBL(_ sender: NSMenuItem) {
+        guard let d = sender.representedObject as? Disk else { return }
+        forgetPassword(for: d.device)
+        alert("已忘记密码", "已从钥匙串删除 \(d.label) 保存的密码。")
+        refresh()
+    }
+
+    /// 解锁：密码写入 0600 临时文件后以 --password-file 传入，
+    /// 避免密码出现在进程参数（ps）中；用完立即删除。
+    private func unlockBitLocker(device: String, password: String) -> Bool {
+        let tmp = NSTemporaryDirectory() + "ntfsformac-bl-\(UUID().uuidString)"
+        do {
+            try password.write(toFile: tmp, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp)
+        } catch {
+            alert("解锁失败", "无法创建临时密码文件：\(error.localizedDescription)")
+            return false
+        }
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        return runAdmin(["unlock", device, "--password-file", tmp])
+    }
+
+    // MARK: - 钥匙串（BitLocker 密码记忆）
+
+    private func savePassword(_ pw: String, for device: String) {
+        run("/usr/bin/security", ["delete-generic-password", "-s", keychainService, "-a", device])
+        run("/usr/bin/security", ["add-generic-password", "-s", keychainService, "-a", device, "-w", pw])
+    }
+
+    private func loadPassword(for device: String) -> String? {
+        let (code, out) = runWithStatus("/usr/bin/security",
+                                        ["find-generic-password", "-s", keychainService, "-a", device, "-w"])
+        guard code == 0 else { return nil }
+        let pw = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return pw.isEmpty ? nil : pw
+    }
+
+    private func forgetPassword(for device: String) {
+        run("/usr/bin/security", ["delete-generic-password", "-s", keychainService, "-a", device])
+    }
+
     @objc private func actionOpen(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk, !d.mountPoint.isEmpty else { return }
         NSWorkspace.shared.open(URL(fileURLWithPath: d.mountPoint))
@@ -271,14 +409,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     @discardableResult
     private func runAdmin(_ args: [String]) -> Bool {
         // sudo 免密直接执行 ntfsctl（sudoers 白名单仅放行 ntfsctl，无 bash 包装，最小化提权面）
-        var all = ["-n", Self.ntfsctl]
-        all += args
-        let out = run("/usr/bin/sudo", all)
-        let ok = !out.contains("error") && !out.contains("password")
-        if !ok {
+        let (code, out) = runWithStatus("/usr/bin/sudo", ["-n", Self.ntfsctl] + args)
+        guard code == 0 else {
             alert("操作失败", "\(Self.ntfsctl) \(args.joined(separator: " "))\n\n\(out)\n\n提示：若提示需要密码，请检查 /etc/sudoers.d/ntfsformac 免密配置。")
+            return false
         }
-        return ok
+        return true
     }
 
     private func alert(_ title: String, _ text: String) {
@@ -336,7 +472,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     // MARK: - 子进程
 
+    @discardableResult
     private func run(_ path: String, _ args: [String]) -> String {
+        runWithStatus(path, args).1
+    }
+
+    /// 执行子进程，返回（退出码, 合并后的 stdout+stderr）
+    private func runWithStatus(_ path: String, _ args: [String]) -> (Int32, String) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
@@ -348,10 +490,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             try p.run()
             p.waitUntilExit()
         } catch {
-            return ""
+            return (-1, "")
         }
         let d = out.fileHandleForReading.readDataToEndOfFile()
         let e = err.fileHandleForReading.readDataToEndOfFile()
-        return (String(data: d, encoding: .utf8) ?? "") + (String(data: e, encoding: .utf8) ?? "")
+        return (p.terminationStatus,
+                (String(data: d, encoding: .utf8) ?? "") + (String(data: e, encoding: .utf8) ?? ""))
     }
 }

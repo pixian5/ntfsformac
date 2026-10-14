@@ -25,6 +25,11 @@ as_root() {
   if [ "$(id -u)" = "0" ]; then "$@"; else sudo "$@"; fi
 }
 
+# 仅在免密可用时提权（绝不弹密码框）：非 root 且 sudo -n 不可用时直接失败
+as_root_np() {
+  if [ "$(id -u)" = "0" ]; then "$@"; else sudo -n "$@"; fi
+}
+
 # ---------- 设备枚举：diskutil list → 每个 NTFS 设备 ----------
 # 输出: device|label（多行，仅 NTFS）
 # diskutil list 行格式: <#>: <TYPE> <NAME...> <SIZE> <IDENTIFIER>，NAME 可能含空格
@@ -102,6 +107,151 @@ label_of() {
   ntfs_devices | awk -v d="$dev" '$1==d { sub(/^[^ ]+ /, ""); print; exit }'
 }
 
+# ==================== BitLocker（加密卷）支持 ====================
+# 依赖 dislocker-fuse（源码编译：Aorimn/dislocker v0.7.3 + mbedTLS3 回填 + FUSE-T 适配）
+# 解密链：/dev/diskXsY --dislocker-fuse--> <容器>/dislocker-file --ntfs-3g--> /Volumes/<卷标>
+DISLOCKER=/usr/local/bin/dislocker-fuse
+BL_CONTAINER_DIR=/var/run/ntfsformac/bl
+
+# 读设备首扇区偏移 3 起 8 字节，判断 BitLocker 签名
+# 合法签名：-FVE-FS-（新格式）或 MSWIN4.1（旧格式）；普通 NTFS 为 "NTFS    "
+# 需 root 才能读裸设备；读不到一律按「非 BitLocker」处理
+is_bitlocker() {
+  local dev="$1" sig
+  # 只读首扇区 11 字节再取偏移 3 起的 8 字节（扇区对齐，兼容 macOS 裸设备）
+  # 有读权限就直接读（如用户自己附加的磁盘镜像）；否则走免密提权（真实物理盘），
+  # 用 sudo -n 保证绝不弹密码框：无权限时静默失败，按「非 BitLocker」处理
+  sig=""
+  [ -r "/dev/$dev" ] && sig=$(dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  [ -n "$sig" ] || sig=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  case "$sig" in
+    "-FVE-FS-"|"MSWIN4.1") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# dislocker-fuse 的容器挂载点（解密卷虚拟文件 dislocker-file 所在目录）
+bl_container() { printf '%s/%s' "$BL_CONTAINER_DIR" "$1"; }
+# 解密后暴露的虚拟卷文件（可直接交给 ntfs-3g 挂载）
+bl_file()      { printf '%s/dislocker-file' "$(bl_container "$1")"; }
+
+# 容器在挂载表中的真实挂载点。macOS 的 /var 是 /private/var 的符号链接，
+# /sbin/mount 输出的是真实路径，故统一按 "/ntfsformac/bl/<dev> (" 后缀匹配再取挂载点。
+bl_container_mp() {
+  /sbin/mount 2>/dev/null | grep -F "/ntfsformac/bl/$1 (" | head -1 | sed 's/^.* on //; s/ (.*$//'
+}
+
+# 该设备是否已解锁（dislocker-fuse 容器处于挂载状态）
+bl_unlocked() { [ -n "$(bl_container_mp "$1")" ]; }
+
+# 读取解密卷的真实 NTFS 卷标（未解锁读不到，回退 BitLocker-<dev>）
+bl_label() {
+  local dev="$1" f l
+  f=$(bl_file "$dev")
+  l=""
+  [ -e "$f" ] && l=$(as_root_np ntfslabel "$f" 2>/dev/null | head -1)
+  [ -n "$l" ] || l="BitLocker-$dev"
+  printf '%s' "$l"
+}
+
+# 等待解密卷「可写就绪」：FUSE-T 是双层堆叠（ntfs-3g 叠在 dislocker-fuse 之上），
+# 刚挂载后有约 0.5 秒的未就绪窗口，此时用户身份的首个写入会返回 EACCES（Permission denied）。
+# 以真实属主身份试建探针文件，成功即返回；最多等 5 秒，超时也放行（不阻断挂载）。
+bl_wait_ready() {
+  local mp="$1" owner="$2" probe="$mp/.ntfsformac.probe" i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    # 以属主身份创建+删除探针文件；ntfsctl 通常以 root 运行，su 切到普通用户无需密码
+    if as_root su -l "$owner" -c "touch '$probe' && rm -f '$probe'" 2>/dev/null; then
+      trace "bl: 解密卷已就绪（探测 $i 次）"
+      return 0
+    fi
+    sleep 0.5
+  done
+  trace "bl: 解密卷就绪探测超时，按已挂载继续"
+  return 1
+}
+
+# 停止并清理某设备的 dislocker-fuse 容器（不再解密该卷）
+bl_close_container() {
+  local dev="$1" c mp pids pid
+  c=$(bl_container "$dev")
+  mp=$(bl_container_mp "$dev")
+  # 先全局刷盘：FUSE-T 为写回缓存，确保 ntfs-3g 已写入 dislocker-file 的数据落到后端设备
+  as_root sync 2>/dev/null || true
+  if [ -n "$mp" ]; then
+    trace "bl: unmount container $mp"
+    as_root diskutil unmount "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
+    as_root sync 2>/dev/null || true
+  fi
+  pids=$(pgrep -f "dislocker-fuse .*/dev/$dev" 2>/dev/null)
+  for pid in $pids; do
+    trace "bl: SIGTERM dislocker-fuse pid=$pid"
+    as_root kill -TERM "$pid" 2>/dev/null || true
+  done
+  [ -n "$pids" ] && sleep 1
+  for pid in $pids; do
+    kill -0 "$pid" 2>/dev/null && as_root kill -9 "$pid" 2>/dev/null || true
+  done
+  as_root rmdir "$c" 2>/dev/null || true
+}
+
+# 解锁 BitLocker 卷：$1=设备 $2...=dislocker 解密方式参数（如 -u密码 / -p恢复密码 / -fBEK / -c）
+bl_unlock_one() {
+  local dev="$1"; shift
+  local c f out rc
+  is_bitlocker "$dev" || die "/dev/$dev 不是 BitLocker 加密卷"
+  [ -x "$DISLOCKER" ] || die "未安装 dislocker-fuse（请先运行 install-driver.sh）"
+
+  if bl_unlocked "$dev"; then
+    log "$dev 已解锁"
+    mount_one "$dev"
+    return 0
+  fi
+
+  lock_mount || die "另一个挂载操作进行中，请稍后再试"
+  trap 'unlock_mount' EXIT
+
+  c=$(bl_container "$dev")
+  as_root mkdir -p "$c" || die "创建容器目录 $c 失败"
+
+  trace "bl: dislocker-fuse -V /dev/$dev <method> -- $c"
+  out=$(as_root "$DISLOCKER" -V "/dev/$dev" "$@" -- "$c" 2>&1); rc=$?
+  if [ "$rc" != "0" ]; then
+    log "$out"
+    as_root rmdir "$c" 2>/dev/null || true
+    unlock_mount; trap - EXIT
+    die "BitLocker 解锁失败（密码/恢复密钥错误，或卷损坏）"
+  fi
+
+  f=$(bl_file "$dev")
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "$f" ] && break
+    sleep 1
+  done
+  if [ ! -e "$f" ]; then
+    as_root umount "$c" 2>/dev/null || true
+    as_root rmdir "$c" 2>/dev/null || true
+    unlock_mount; trap - EXIT
+    die "解锁后未出现 dislocker-file（解密卷未就绪）"
+  fi
+
+  unlock_mount; trap - EXIT
+  log "已解锁: /dev/$dev → $(bl_container "$dev")"
+  mount_one "$dev"
+}
+
+# 锁定 BitLocker 卷：先卸 ntfs-3g，再停 dislocker-fuse
+bl_lock_one() {
+  local dev="$1" label mp
+  is_bitlocker "$dev" || { log "$dev 不是 BitLocker 卷"; return 0; }
+  label=$(bl_label "$dev")
+  mp=$(mountpoint_of "$dev" "$label")
+  [ -n "$mp" ] && unmount_one "$dev"
+  bl_close_container "$dev"
+  log "已锁定: /dev/$dev"
+}
+
 # ---------- 挂载互斥锁（mkdir 原子锁，防守护进程与手动操作并发叠加挂载） ----------
 MOUNT_LOCK=/var/run/ntfsformac/mount.lock
 LOCK_TTL=30
@@ -130,6 +280,40 @@ unlock_mount() {
 mount_one() {
   local dev="$1" label owner uid gid ident parent mp line
   ident="$dev"
+
+  # ---- BitLocker 加密卷分支 ----
+  # 未解锁则跳过（自动挂载不猜密码，等菜单栏/CLI 解锁）；已解锁则挂载解密卷
+  if is_bitlocker "$dev"; then
+    if ! bl_unlocked "$dev"; then
+      trace "bl: $dev 未解锁，跳过自动挂载"
+      return 0
+    fi
+    label=$(bl_label "$dev")
+    if [ "$(mount_state "$dev" "$label")" != "none" ]; then
+      log "已挂载读写: $label → $(mountpoint_of "$dev" "$label")"
+      return 0
+    fi
+    lock_mount || die "另一个挂载操作进行中，请稍后再试"
+    trap 'unlock_mount' EXIT
+    owner=$(resolve_owner); [ -n "$owner" ] || owner=$(id -un)
+    uid=$(id -u "$owner" 2>/dev/null) || uid=501
+    gid=$(id -g "$owner" 2>/dev/null) || gid=20
+    mp="$MOUNT_ROOT/$label"
+    as_root mkdir -p "$mp" || die "创建挂载点 $mp 失败"
+    if ! as_root "$NTFS_3G" "$(bl_file "$dev")" "$mp" \
+        -o "recover,noatime,big_writes,uid=$uid,gid=$gid,volname=$label,local" 2>&1; then
+      log "mount 失败，去掉 big_writes/local 重试..."
+      as_root "$NTFS_3G" "$(bl_file "$dev")" "$mp" \
+          -o "recover,noatime,uid=$uid,gid=$gid,volname=$label" || die "挂载解密卷失败"
+    fi
+    as_root mdutil -i off "$mp" >/dev/null 2>&1 || true
+    # 等待解密卷可写就绪，避免用户/菜单栏 App 紧接着写入时报 Permission denied
+    bl_wait_ready "$mp" "$owner"
+    log "已挂载读写(BitLocker): $label → $mp"
+    unlock_mount; trap - EXIT
+    return 0
+  fi
+
   label=$(label_of "$dev")
   # 无 label 兜底
   [ -z "$label" ] && label="NTFS-${ident//\//_}"
@@ -222,7 +406,7 @@ unmount_competitors() {
 # ---------- 卸载 ----------
 unmount_one() {
   local dev="$1" label mp
-  label=$(label_of "$dev")
+  if is_bitlocker "$dev"; then label=$(bl_label "$dev"); else label=$(label_of "$dev"); fi
   mp=$(mountpoint_of "$dev" "$label")
   if [ -z "$mp" ]; then log "未挂载: $dev"; return 0; fi
   # 置挂起标记，防止 daemon 60s 内自动重挂（尊重手动卸载意图）
@@ -237,7 +421,7 @@ unmount_one() {
 # ---------- 弹出 ----------
 eject_one() {
   local dev="$1" label pid parent
-  label=$(label_of "$dev")
+  if is_bitlocker "$dev"; then label=$(bl_label "$dev"); else label=$(label_of "$dev"); fi
   parent="${dev%s*}"
   [ -z "$parent" ] && parent="$dev"
   trace "eject_one dev=$dev label=$label parent=$parent"
@@ -255,7 +439,8 @@ eject_one() {
   done
 
   # 3. 停掉该设备的 ntfs-3g 进程（先 SIGTERM 优雅退出，1s 后仍存活才 KILL）
-  pids=$(pgrep -f "ntfs-3g .*/dev/$dev" 2>/dev/null)
+  #    普通 NTFS 挂 /dev/<dev>；BitLocker 解密卷挂 <容器>/dislocker-file，两种都要覆盖
+  pids=$(pgrep -f "ntfs-3g .*(/dev/$dev|/bl/$dev/dislocker-file)" 2>/dev/null)
   for pid in $pids; do
     trace "eject: SIGTERM ntfs-3g pid=$pid"
     as_root kill -TERM "$pid" 2>/dev/null || true
@@ -268,6 +453,11 @@ eject_one() {
         as_root kill -9 "$pid" 2>/dev/null || true
       fi
     done
+  fi
+
+  # 3.5 BitLocker：先卸 ntfs-3g 解密挂载，再停 dislocker-fuse 容器
+  if is_bitlocker "$dev"; then
+    bl_close_container "$dev"
   fi
 
   # 4. 清理空挂载点
@@ -303,15 +493,67 @@ case "$CMD" in
   list)
     PORCELAIN=""
     for a in "$@"; do [ "$a" = "--porcelain" ] && PORCELAIN=1; done
+    # 输出: device|label|<fs:ntfs|bitlocker>|mountpoint|<state:rw|ro|none|locked>
     ntfs_devices | while IFS=' ' read -r dev label; do
       [ -n "$dev" ] || continue
-      st=$(mount_state "$dev" "$label")
-      mp=$(mountpoint_of "$dev" "$label")
-      if [ -n "$PORCELAIN" ]; then
-        printf '%s|%s|ntfs|%s|%s\n' "$dev" "$label" "$mp" "$st"
+      fs=ntfs
+      if is_bitlocker "$dev"; then
+        fs=bitlocker
+        if bl_unlocked "$dev"; then
+          label=$(bl_label "$dev")
+          st=$(mount_state "$dev" "$label")
+          mp=$(mountpoint_of "$dev" "$label")
+        else
+          label="BitLocker-$dev"
+          st=locked
+          mp=""
+        fi
       else
-        printf '%-10s %-20s %-6s %s\n' "$dev" "$label" "$st" "$mp"
+        st=$(mount_state "$dev" "$label")
+        mp=$(mountpoint_of "$dev" "$label")
       fi
+      if [ -n "$PORCELAIN" ]; then
+        printf '%s|%s|%s|%s|%s\n' "$dev" "$label" "$fs" "$mp" "$st"
+      else
+        printf '%-10s %-22s %-9s %-7s %s\n' "$dev" "$label" "$fs" "$st" "$mp"
+      fi
+    done
+    ;;
+  unlock)
+    shift
+    UT="${1:-all}"; shift 2>/dev/null || true
+    PW_FILE=""; PW=""; BEK=""; CLEARKEY=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --password-file) PW_FILE="${2:-}"; shift 2 ;;
+        --password)      PW="${2:-}"; shift 2 ;;
+        --bek)           BEK="${2:-}"; shift 2 ;;
+        --clearkey)      CLEARKEY=1; shift ;;
+        --)              shift; break ;;
+        *)               break ;;
+      esac
+    done
+    # 密码文件优先（避免密码出现在 ps/历史里）
+    if [ -n "$PW_FILE" ]; then
+      [ -r "$PW_FILE" ] || die "无法读取密码文件 $PW_FILE"
+      PW=$(cat "$PW_FILE")
+    fi
+    if [ -n "$PW" ]; then
+      set -- "-u$PW"                 # 用户密码；dislocker 内部会把 argv 里的密码抹成 X
+    elif [ -n "$BEK" ]; then
+      set -- "-f" "$BEK"             # USB 上的 .BEK 恢复密钥文件
+    elif [ -n "$CLEARKEY" ]; then
+      set -- "-c"                    # 明文密钥（无需密码，仅明文保护的卷）
+    else
+      die "缺少解锁凭据：请用 --password / --password-file / --bek / --clearkey"
+    fi
+    for dev in $(resolve_devices "$UT"); do
+      bl_unlock_one "$dev" "$@"
+    done
+    ;;
+  lock)
+    for dev in $(resolve_devices "$TARGET"); do
+      bl_lock_one "$dev"
     done
     ;;
   mount|auto)
@@ -332,7 +574,17 @@ case "$CMD" in
     done
     ;;
   *)
-    echo "用法: ntfsctl list|mount|unmount|eject [disk|label|all] [--porcelain]" >&2
+    cat >&2 <<'USAGE'
+用法:
+  ntfsctl list [--porcelain]                 列出 NTFS/BitLocker 盘及状态
+  ntfsctl mount   <disk|label|all>           挂载为读写
+  ntfsctl unmount <disk|label|all>           卸载（不弹出）
+  ntfsctl eject   <disk|label|all>           安全弹出
+  ntfsctl lock    <disk|label|all>           重新锁定 BitLocker 卷并卸载
+  ntfsctl unlock  <disk|label|all> <凭据>    解锁 BitLocker 并挂载读写
+     凭据: --password-file <路径> | --password <密码> | --bek <BEK文件> | --clearkey
+  ntfsctl auto                               把所有盘挂为读写（daemon 调用）
+USAGE
     exit 2
     ;;
 esac

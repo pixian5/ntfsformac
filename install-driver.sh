@@ -4,6 +4,7 @@
 # 可重复运行：已装好会跳过对应步骤
 set -uo pipefail
 
+ROOT="$(cd "$(dirname "$0")" && pwd)"
 NTFS_3G=/usr/local/bin/ntfs-3g
 FUSE_T_LIB=/usr/local/lib/libfuse-t.dylib
 FUSE_T_SERVER="/Library/Application Support/fuse-t/bin"
@@ -66,6 +67,90 @@ if [ ! -x "$NTFS_3G" ] || ! otool -L "$NTFS_3G" 2>/dev/null | grep -q libfuse-t;
   ) || exit 1
   log "make install（请在弹出的授权框中确认管理员密码）..."
   osascript -e "do shell script \"cd '$BUILD_DIR' && make install 2>&1\" with administrator privileges" || die "make install 失败"
+fi
+
+# ---------- 构建 dislocker（BitLocker 解锁/读写，v0.7.3 + FUSE-T 适配） ----------
+# dislocker 把 BitLocker 卷解密为一个虚拟文件（<容器目录>/dislocker-file），再交给 ntfs-3g 挂载。
+# 必须用 tag v0.7.3：它用 FUSE_USE_VERSION=26，兼容 FUSE-T 的 FUSE 2.9 API；
+# master 需要 FUSE 3.14，与 FUSE-T 不兼容。
+# 构建产物仅暂存到项目 build/dislocker，由 install-service.sh（root，免密白名单）安装到
+# /usr/local/{bin,lib}，这样整条链路不新增任何授权框。
+DISLOCKER_BUILD=/tmp/dislocker-build
+DISLOCKER_SRC="$DISLOCKER_BUILD/dislocker"
+DISLOCKER_STAGE="$ROOT/build/dislocker"
+
+dislocker_staged_ok() {
+  [ -x "$DISLOCKER_STAGE/dislocker-fuse" ] && [ -e "$DISLOCKER_STAGE/libdislocker.0.7.dylib" ]
+}
+
+if dislocker_staged_ok; then
+  log "dislocker 已构建过，跳过（暂存于 $DISLOCKER_STAGE）"
+else
+  log "构建 dislocker v0.7.3（FUSE-T 适配）..."
+  command -v cmake >/dev/null 2>&1 || brew install cmake || die "安装 cmake 失败"
+  brew list --formula 2>/dev/null | grep -q '^mbedtls@3$' || brew install mbedtls@3 || die "安装 mbedtls@3 失败"
+  MBEDTLS3_PREFIX=$(brew --prefix mbedtls@3)
+  # mbedTLS 3 的头文件位于 include/mbedtls/ 下（FindPolarSSL 会把 INC_FOLDER 解析为 mbedtls）
+  [ -f "$MBEDTLS3_PREFIX/include/mbedtls/mbedtls_config.h" ] || die "mbedtls@3 头文件缺失: $MBEDTLS3_PREFIX"
+
+  rm -rf "$DISLOCKER_BUILD"
+  mkdir -p "$DISLOCKER_BUILD"
+  git clone --depth 1 --branch v0.7.3 https://github.com/Aorimn/dislocker.git "$DISLOCKER_SRC" \
+    || die "clone dislocker 失败"
+
+  # 三个补丁：mbedTLS 3 兼容 + 链接 libfuse-t + 无条件用 FUSE-T 的 <fuse.h>
+  python3 - "$DISLOCKER_SRC" <<'PYEOF' || die "dislocker 源码补丁失败"
+import io, os, sys
+src = sys.argv[1]
+
+def patch(path, old, new):
+    p = os.path.join(src, path)
+    with io.open(p, encoding='utf-8') as fh:
+        t = fh.read()
+    # 先判断锚点：锚点还在就替换；锚点已消失且新串已在 => 已打过补丁
+    if old in t:
+        with io.open(p, 'w', encoding='utf-8') as fh:
+            fh.write(t.replace(old, new, 1))
+        print('  [ok] %s' % path)
+    elif new in t:
+        print('  [skip] %s 已修改' % path)
+    else:
+        raise SystemExit('  [fail] %s 未找到锚点' % path)
+
+# 1) mbedTLS 3 兼容（上游 commit 2cfbba2）
+patch('include/dislocker/ssl_bindings.h.in',
+      '#include "@POLARSSL_INC_FOLDER@/config.h"\n#include "@POLARSSL_INC_FOLDER@/version.h"\n',
+      '#include "@POLARSSL_INC_FOLDER@/version.h"\n'
+      '#if MBEDTLS_VERSION_MAJOR >= 3\n'
+      '#include "@POLARSSL_INC_FOLDER@/mbedtls_config.h"\n'
+      '#include "@POLARSSL_INC_FOLDER@/compat-2.x.h"\n'
+      '#else\n'
+      '#include "@POLARSSL_INC_FOLDER@/config.h"\n'
+      '#endif\n')
+# 2) 链接 libfuse-t（原为 osxfuse_i64/macFUSE）
+patch('src/CMakeLists.txt', 'set (FUSE_LIB osxfuse_i64)', 'set (FUSE_LIB fuse-t)')
+# 3) 无条件包含 <fuse.h>（FUSE-T 头文件在 /usr/local/include/fuse）
+patch('src/dislocker-fuse.c',
+      '#ifdef __DARWIN\n# include <osxfuse/fuse.h>\n#else\n# include <fuse.h>\n#endif /* __DARWIN */',
+      '# include <fuse.h>')
+PYEOF
+
+  # 注意：cmake 4.x 拒绝 cmake_minimum_required(<3.5)，用策略下限绕过
+  cmake -S "$DISLOCKER_SRC" -B "$DISLOCKER_SRC/build-mac" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    -DFUSE_INCLUDE_DIRS=/usr/local/include/fuse \
+    -DFUSE_LIBRARIES=/usr/local/lib/libfuse-t.dylib \
+    -DPOLARSSL_INCLUDE_DIRS="$MBEDTLS3_PREFIX/include" \
+    -DPOLARSSL_LIBRARIES="$MBEDTLS3_PREFIX/lib/libmbedcrypto.dylib" \
+    -DCMAKE_DISABLE_FIND_PACKAGE_Ruby=TRUE || die "dislocker cmake 配置失败"
+  make -C "$DISLOCKER_SRC/build-mac" -j"$(sysctl -n hw.ncpu)" || die "dislocker 编译失败"
+
+  rm -rf "$DISLOCKER_STAGE"; mkdir -p "$DISLOCKER_STAGE"
+  cp "$DISLOCKER_SRC/build-mac/src"/dislocker-* "$DISLOCKER_STAGE/"
+  cp -R "$DISLOCKER_SRC/build-mac/src"/libdislocker* "$DISLOCKER_STAGE/"
+  otool -L "$DISLOCKER_STAGE/dislocker-fuse" | grep -q libfuse-t || die "dislocker-fuse 未链接 libfuse-t"
+  log "dislocker 构建完成，暂存于 $DISLOCKER_STAGE"
 fi
 
 # ---------- 卸载 gromgit 同名公式（避免 PATH 优先位链到 macFUSE 版） ----------

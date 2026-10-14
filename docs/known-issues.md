@@ -123,3 +123,43 @@ NTFS 盘刚插入、diskutil 还没读出 NTFS 卷标时，`diskutil list` 显�
 - 切给 Windows：macOS 先 `ntfsctl eject <dev>` → 重新添加 hdd 设备 → 重启虚拟机。
 - 切回 macOS：Windows 先安全弹出盘 → 停虚拟机删设备 → macOS attach + `ntfsctl mount`。
 - 数据互通验证：Windows 生成的 `$RECYCLE.BIN`、`System Volume Information` 在 macOS 挂载后可见；中文文件名在 cmd 里显示乱码是 GBK/UTF-8 编码问题，文件本身正常。
+
+## BitLocker 支持（dislocker + FUSE-T）
+
+### 22. FUSE-T 双层堆叠有约 0.5 秒「未就绪窗口」
+BitLocker 解密链是 `ntfs-3g` 叠在 `dislocker-fuse` 之上（两层 FUSE-T）。挂载刚返回时，
+**用户身份的首个写入会返回 EACCES（Permission denied）**，实测第 1 次失败（约 6ms）、第 2 次（约 0.5s 后）成功。
+这不是权限配置问题（挂载点已是属主的 0777），而是双层 NFS/FUSE 初始化未完成的瞬态。
+- 修复：`ntfsctl` 挂载 BitLocker 卷后调用 `bl_wait_ready`，以**属主身份**试建/删探针文件，
+  成功才返回（最多等 5 秒，超时也放行）。修好后 `unlock` 返回即写入成功。
+- 排查提示：用 root 探测不可靠（root 与 uid=501 的权限路径不同），必须用真实属主身份探测。
+
+### 23. FUSE-T 写回缓存：锁定前先 sync
+`bl_close_container` 中先 `sync`，再 `diskutil unmount` 容器，最后才 SIGTERM `dislocker-fuse`，
+确保 `ntfs-3g` 写入 `dislocker-file` 的数据落到后端设备。
+实测：即使不 sync，写→立即 lock→重新解锁数据仍在（层层 flush 有效），sync 只是安全网。
+
+### 24. sudo 1.9.x 对带参数的 NOPASSWD 规则要求参数**完全匹配**
+sudoers 里写 `/bin/bash <脚本>` 时，调用 `/bin/bash <脚本> foo` **不会**命中免密，会重新弹密码框。
+- 修复：需要传参的脚本（如 `test/test-bitlocker.sh --device ...`）白名单用 `*` 通配
+  （`/bin/bash <脚本>*`，`*` 也可匹配空串，零参数同时命中）；
+- `build-app.sh` 改为零参数调用 `install-service.sh`，由脚本内部从 `SUDO_USER`/`/dev/console` 推导属主与源路径。
+
+### 25. dislocker v0.7.3 在 FUSE-T 上的构建要点
+- 必须用 **v0.7.3**（`FUSE_USE_VERSION=26`）；master 要求 FUSE 3.14，与 FUSE-T 不兼容。
+- 三处补丁：`ssl_bindings.h.in`（mbedTLS3 用 `mbedtls_config.h`+`compat-2.x.h`）、
+  `CMakeLists.txt`（`osxfuse`→`fuse-t`）、`dislocker-fuse.c`（去掉 osxfuse 头分支）。
+- mbedTLS 用 `brew install mbedtls@3`（keg-only，头文件在 `include/mbedtls/mbedtls_config.h`，
+  容易误写成 `include/mbedtls_config.h`）。
+- cmake 4.x 拒绝低版本 minimum：需 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5`；
+  `FindPolarSSL.cmake` 只找 `/usr/local/include`，需显式传 `-DPOLARSSL_INCLUDE_DIRS`/`-DPOLARSSL_LIBRARIES`。
+- 补丁函数幂等判断要**先判断 old 是否存在**再判断 new，否则 new 是原文子串会误判「已修改」而跳过。
+
+### 26. 无真实加密盘时如何造一块「真实」BitLocker 卷
+- BitCracker 项目提供真实加密测试镜像：`Images/imgWin10Compat.vhd`（40MB，Windows 10 兼容模式 AES-CCM）。
+- 它是 **fixed VHD 整盘**：解析 MBR 找到 BitLocker 分区（偏移 65536，签名 `-FVE-FS-`），提取该区域为裸卷；
+  口令见 `Dictionary/user_passwords.txt`。
+- macOS 上裸卷文件无分区表，`diskutil` 识别为无分区，`ntfsctl list` 看不到 →
+  用 Python 把裸卷包进**标准 GPT 磁盘镜像**（分区类型 Microsoft Basic Data），即可呈现为 `diskXs1` 走完整流程。
+- 排错：Parallels 虚拟机盘是 Compressed 格式（`DiskDescriptor.xml` `Type=Compressed`）非裸盘，dislocker 读不了；
+  picoCTF 的 bitlocker 镜像 CDN 已失效。

@@ -1,6 +1,6 @@
 #!/bin/bash
-# build-app.sh — 编译打包 NTFSMounter.app 并安装运行（版本号构建后 +0.0.1）
-# 流程: 结束旧进程 → 删旧 .app → 编译 → 图标 → 组装 → 装服务 → 前台运行 → 验证 → 版本+1
+# build-app.sh — 编译打包 NTFSMounter.app 并安装运行（版本号构建前 +0.0.1）
+# 流程: 版本+1 → 结束旧进程 → 删旧 .app → 编译 → 图标 → 组装 → 装服务 → 前台运行 → 验证
 set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
@@ -13,6 +13,12 @@ BUILD="$ROOT/build"
 
 log() { printf '[build] %s\n' "$*"; }
 die() { printf '[build] 错误: %s\n' "$*" >&2; exit 1; }
+
+# 0. 版本号 +0.0.1（满十进一）。先自增，保证本次产物版本号与 VERSION 文件一致
+NEW=$(awk -F. '{v=$1*10000+$2*100+$3+1; printf "%d.%d.%d\n", int(v/10000), int(v/100)%100, v%100}' <<<"$VER")
+echo "$NEW" > VERSION
+log "版本号: $VER -> $NEW"
+VER="$NEW"
 
 # 0. 结束旧进程（App 由 install-service.sh 在 /Applications 覆盖安装）
 log "结束旧进程 ..."
@@ -67,8 +73,10 @@ codesign --force --deep --sign - "$STAGE" >/dev/null 2>&1 || true
 
 # 4. 安装到 /Applications + 安装 ntfsctl / 自动挂载服务 / sudoers 白名单
 #    （所有提权收口到 install-service.sh，sudoers 仅放行该脚本与 ntfsctl）
+#    注意：sudo 1.9.17 要求 NOPASSWD 命令参数完全匹配，故这里必须「零参数」调用
+#          （路径写全 /bin/bash 且不加 -n 以外的参数），参数由脚本内部推导
 log "安装到 /Applications 与安装服务 ..."
-sudo bash "$ROOT/scripts/install-service.sh" "$USER" "$STAGE" \
+sudo -n /bin/bash "$ROOT/scripts/install-service.sh" \
   && log "服务安装完成" || log "警告: 服务安装未完成，可稍后手动运行 scripts/install-service.sh"
 
 # 5. 前台运行
@@ -83,8 +91,3 @@ if pgrep -f "$APP_NAME" >/dev/null; then
 else
   log "警告: 未检测到 $APP_NAME 进程"
 fi
-
-# 7. 版本号 +0.0.1（满十进一）
-NEW=$(awk -F. '{v=$1*10000+$2*100+$3+1; printf "%d.%d.%d\n", int(v/10000), int(v/100)%100, v%100}' <<<"$VER")
-echo "$NEW" > VERSION
-log "版本号已更新: $VER -> $NEW"
