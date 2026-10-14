@@ -14,12 +14,11 @@ BUILD="$ROOT/build"
 log() { printf '[build] %s\n' "$*"; }
 die() { printf '[build] 错误: %s\n' "$*" >&2; exit 1; }
 
-# 0. 结束旧进程、删除旧 .app
+# 0. 结束旧进程（App 由 install-service.sh 在 /Applications 覆盖安装）
 log "结束旧进程 ..."
 pkill -f "$APP_NAME" 2>/dev/null
 sleep 1
 pgrep -f "$APP_NAME" >/dev/null && pkill -9 -f "$APP_NAME" 2>/dev/null
-sudo rm -rf "$APP_DIR"
 mkdir -p "$BUILD"
 
 # 1. 编译
@@ -66,11 +65,10 @@ cat > "$STAGE/Contents/Info.plist" <<PLIST
 PLIST
 codesign --force --deep --sign - "$STAGE" >/dev/null 2>&1 || true
 
-# 4. 安装到 /Applications + 安装 ntfsctl 与自动挂载服务（sudo 免密，无授权框）
+# 4. 安装到 /Applications + 安装 ntfsctl / 自动挂载服务 / sudoers 白名单
+#    （所有提权收口到 install-service.sh，sudoers 仅放行该脚本与 ntfsctl）
 log "安装到 /Applications 与安装服务 ..."
-sudo rm -rf "$APP_DIR"
-sudo cp -R "$STAGE" "$APP_DIR"
-sudo bash "$ROOT/scripts/install-service.sh" "$USER" \
+sudo bash "$ROOT/scripts/install-service.sh" "$USER" "$STAGE" \
   && log "服务安装完成" || log "警告: 服务安装未完成，可稍后手动运行 scripts/install-service.sh"
 
 # 5. 前台运行

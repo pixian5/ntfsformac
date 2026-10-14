@@ -233,19 +233,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc private func actionMount(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk else { return }
-        runAdmin("\(Self.ntfsctl) mount \(d.device)")
+        runAdmin(["mount", d.device])
         refresh()
     }
 
     @objc private func actionUnmount(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk else { return }
-        runAdmin("\(Self.ntfsctl) unmount \(d.device)")
+        runAdmin(["unmount", d.device])
         refresh()
     }
 
     @objc private func actionEject(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk else { return }
-        runAdmin("\(Self.ntfsctl) eject \(d.device)")
+        runAdmin(["eject", d.device])
         refresh()
     }
 
@@ -269,12 +269,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // MARK: - 特权执行
 
     @discardableResult
-    private func runAdmin(_ command: String) -> Bool {
-        // sudo 已配置免密（/etc/sudoers.d/ntfsformac），直接提权执行，无需授权框
-        let out = run("/usr/bin/sudo", ["-n", "/bin/bash", "-c", command])
+    private func runAdmin(_ args: [String]) -> Bool {
+        // sudo 免密直接执行 ntfsctl（sudoers 白名单仅放行 ntfsctl，无 bash 包装，最小化提权面）
+        var all = ["-n", Self.ntfsctl]
+        all += args
+        let out = run("/usr/bin/sudo", all)
         let ok = !out.contains("error") && !out.contains("password")
         if !ok {
-            alert("操作失败", "\(command)\n\n\(out)\n\n提示：若提示需要密码，请检查 /etc/sudoers.d/ntfsformac 免密配置。")
+            alert("操作失败", "\(Self.ntfsctl) \(args.joined(separator: " "))\n\n\(out)\n\n提示：若提示需要密码，请检查 /etc/sudoers.d/ntfsformac 免密配置。")
         }
         return ok
     }
