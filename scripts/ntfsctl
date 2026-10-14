@@ -157,6 +157,38 @@ is_bitlocker() {
   esac
 }
 
+# ---------- BitLocker 卷 GUID（跨插拔稳定的凭据键） ----------
+# 卷头里有一段明文可读的「Volume GUID」：与设备号无关，重新插拔（disk4→disk6）后仍不变。
+# 因此钥匙串里的 BitLocker 凭据应以它为键，而不是 diskXsY 这种每次插拔都会变的设备名——
+# 后者正是「记住密码后下次插入不自动解锁」的根因（键变了，查不到旧条目）。
+# 布局（见 dislocker metadata.priv.h / metadata.c 的 check_volume_header）：
+#   签名 "-FVE-FS-"（经典 BitLocker）  → 卷头偏移 0xa0  起 16 字节
+#   签名 "MSWIN4.1"（BitLocker-To-Go） → 卷头偏移 0x1a8 起 16 字节
+# 输出：标准 Windows 混序 GUID（如 4967D63B-2E29-4AD8-8399-F6A339E3D001）；
+#       读不到则输出空串（调用方需回退用设备名做键）
+bl_guid() {
+  local dev="$1" sig hex skip
+  sig=""
+  [ -r "/dev/$dev" ] && sig=$(dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  [ -n "$sig" ] || sig=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  case "$sig" in
+    "-FVE-FS-") skip=161 ;;   # 偏移 0xa0 = 160，从第 161 字节起
+    "MSWIN4.1") skip=425 ;;   # 偏移 0x1a8 = 424，从第 425 字节起
+    *) return ;;
+  esac
+  # 用管道把原始字节直接送 od（不经过 shell 变量，避免 NUL 字节被丢弃）
+  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null \
+        | tail -c +"$skip" | head -c 16 | od -An -tx1 -v | tr -d ' \n' | tr 'a-f' 'A-F')
+  [ ${#hex} -eq 32 ] || return
+  # 还原 Windows GUID 的混合端序：前 4/2/2 字节组内反转，后 8 字节保序
+  printf '%s-%s-%s-%s-%s' \
+    "${hex:6:2}${hex:4:2}${hex:2:2}${hex:0:2}" \
+    "${hex:10:2}${hex:8:2}" \
+    "${hex:14:2}${hex:12:2}" \
+    "${hex:16:2}${hex:18:2}" \
+    "${hex:20:2}${hex:22:2}${hex:24:2}${hex:26:2}${hex:28:2}${hex:30:2}"
+}
+
 # dislocker-fuse 的容器挂载点（解密卷虚拟文件 dislocker-file 所在目录）
 bl_container() { printf '%s/%s' "$BL_CONTAINER_DIR" "$1"; }
 # 解密后暴露的虚拟卷文件（可直接交给 ntfs-3g 挂载）
@@ -450,7 +482,7 @@ mount_one() {
       return 0
     fi
     if [ "$ifs" != "ntfs" ]; then
-      die "$dev 解密卷内层文件系统为 $ifs，暂不支持挂载（仅支持 NTFS / exFAT / FAT）"
+      die "$dev 解密卷内层文件系统为 ${ifs}，暂不支持挂载（仅支持 NTFS / exFAT / FAT）"
     fi
     lock_mount || die "另一个挂载操作进行中，请稍后再试"
     trap 'unlock_mount' EXIT
@@ -470,6 +502,26 @@ mount_one() {
     bl_wait_ready "$mp" "$owner"
     log "已挂载读写(BitLocker): $label → $mp"
     unlock_mount; trap - EXIT
+    return 0
+  fi
+
+  # ---- 非 BitLocker 分支：挂载前 NTFS 签名预检 ----
+  # diskutil 会把「Microsoft Basic Data」等非 NTFS 分区也列进候选（ntfs_devices 的宽松匹配），
+  # 直接丢给 ntfs-3g 必然失败并在守护日志里反复刷屏。挂载前先读首扇区偏移 3 起 8 字节校验签名：
+  #   正常 NTFS 卷 = "NTFS    "（十六进制 4e54465320202020）
+  # 只在「确实读到了签名、且签名不是 NTFS」时跳过（return 0 而非 die，守护进程不视为错误）。
+  #
+  # 关键：读不到（空）时必须继续尝试挂载，绝不能跳过！
+  # 因为卷已被 macOS/FSKit 只读挂载时，裸设备读取会因 EBUSY 失败——
+  # 而这恰恰是最需要抢挂成读写的场景（FSKit 在 Tahoe 上会把 NTFS 挂成只读寄生虫）。
+  # 若按「读不到也跳过」处理，只读抢占将永远无法纠正（实测 test-automount.sh 会因此失败）。
+  # 说明：用 od 取十六进制串比对，不经 shell 变量承载原始字节——
+  # 非 NTFS 分区该处常含 NUL 字节，bash 命令替换会丢弃它们并刷警告。
+  local fsig_hex
+  fsig_hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null \
+             | head -c 11 | tail -c 8 | od -An -tx1 -v | tr -d ' \n')
+  if [ -n "$fsig_hex" ] && [ "$fsig_hex" != "4e54465320202020" ]; then
+    log "跳过 ${dev}：首扇区签名非 NTFS（hex=${fsig_hex}），不做无效挂载"
     return 0
   fi
 
@@ -658,12 +710,15 @@ case "$CMD" in
   list)
     PORCELAIN=""
     for a in "$@"; do [ "$a" = "--porcelain" ] && PORCELAIN=1; done
-    # 输出: device|label|<fs:ntfs|bitlocker>|mountpoint|<state:rw|ro|none|locked>
+    # 输出: device|label|<fs:ntfs|bitlocker>|mountpoint|<state:rw|ro|none|locked>|guid
+    # guid 仅 BitLocker 卷有（用于 App 侧做「跨插拔稳定的钥匙串键」）；非 BitLocker 为空
     ntfs_devices | while IFS=' ' read -r dev label; do
       [ -n "$dev" ] || continue
       fs=ntfs
+      guid=""
       if is_bitlocker "$dev"; then
         fs=bitlocker
+        guid=$(bl_guid "$dev")
         if bl_unlocked "$dev"; then
           label=$(bl_label "$dev")
           st=$(mount_state "$dev" "$label")
@@ -678,7 +733,7 @@ case "$CMD" in
         mp=$(mountpoint_of "$dev" "$label")
       fi
       if [ -n "$PORCELAIN" ]; then
-        printf '%s|%s|%s|%s|%s\n' "$dev" "$label" "$fs" "$mp" "$st"
+        printf '%s|%s|%s|%s|%s|%s\n' "$dev" "$label" "$fs" "$mp" "$st" "$guid"
       else
         printf '%-10s %-22s %-9s %-7s %s\n' "$dev" "$label" "$fs" "$st" "$mp"
       fi
@@ -785,7 +840,7 @@ case "$CMD" in
     done
     as_root chmod 644 "$DOUT"/*.bin 2>/dev/null || true
     as_root chmod 644 "$DOUT/metadata.log" 2>/dev/null || true
-    log "已导出到 $DOUT（vol-header.bin + meta-copy*.bin + metadata.log）"
+    log "已导出到 ${DOUT}（vol-header.bin + meta-copy*.bin + metadata.log）"
     ;;
   info)
     # 读取 BitLocker 卷元数据（无需任何凭据）：加密算法、卷 GUID、保护器类型等。

@@ -27,18 +27,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         var fs: String         // ntfs / bitlocker
         var mountPoint: String
         var state: String      // rw / ro / none / locked
+        var guid: String = ""  // BitLocker 卷 GUID（明文可读、跨插拔稳定，用于钥匙串键）；非 BitLocker 为空
     }
 
     private var statusItem: NSStatusItem?
     private var disks: [Disk] = []
     private var timer: Timer?
     private var prevStates: [String: String] = [:]   // device -> state 上次快照（用于事件通知）
-    private var autoTried: Set<String> = []          // 本会话已尝试过自动解锁的设备（避免反复试探）
+    private var autoTried: Set<String> = []          // 本会话已尝试过自动解锁的键（避免反复试探）
+    private var noCredChecked: Set<String> = []      // 本会话已确认「无保存凭据」的键（避免每 3 秒重复查钥匙串）
     private let keychainService = "NTFSFormac"       // 钥匙串条目 service 名（BitLocker 密码记忆）
+
+    // MARK: - 运行日志（开发测试版：详细记录自动解锁等关键决策，便于排错）
+    // 写入 ~/Library/Logs/NTFSFormac/app.log（用户目录可写，符合 macOS 日志惯例；
+    // 绝不记录凭据明文，只记方法码与长度）。
+    private static let appLogPath =
+        (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/NTFSFormac/app.log")
+
+    func appLog(_ s: String) {
+        let dir = (Self.appLogPath as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        // 超过 1MB 就截断重开，避免无限增长
+        if let sz = try? FileManager.default.attributesOfItem(atPath: Self.appLogPath)[.size] as? Int,
+           sz > 1_048_576 {
+            try? FileManager.default.removeItem(atPath: Self.appLogPath)
+        }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(fmt.string(from: Date())) \(s)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let fh = FileHandle(forWritingAtPath: Self.appLogPath) {
+            fh.seekToEndOfFile()
+            fh.write(data)
+            try? fh.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: Self.appLogPath))
+        }
+    }
 
     // MARK: - 生命周期
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        appLog("applicationDidFinishLaunching: 启动")
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let btn = item.button {
             btn.image = NSImage(systemSymbolName: "externaldrive.fill",
@@ -80,23 +110,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
         // BitLocker：若钥匙串里存过凭据（用户密码 / 恢复密码 / .BEK 路径），插入后自动解锁
         //（每设备本会话只试一次，绝不弹窗，也绝不猜密码）
-        autoTried = autoTried.intersection(Set(disks.map { $0.device }))
+        // 键用「卷 GUID」（跨插拔稳定），无 GUID 时回退设备名
+        let liveKeys = Set(disks.map { keychainAccount(for: $0) })
+        autoTried = autoTried.intersection(liveKeys)
+        noCredChecked = noCredChecked.intersection(liveKeys)
         for d in disks where d.fs == "bitlocker" && d.state == "locked" {
-            if autoTried.contains(d.device) { continue }
-            autoTried.insert(d.device)
-            guard let (method, cred) = loadCredential(for: d.device) else { continue }
-            // 记住的 .BEK 文件若已被移走就跳过并清除，避免无谓的失败提示
-            if method == .bekFile && !FileManager.default.fileExists(atPath: cred) {
-                forgetPassword(for: d.device)
+            let key = keychainAccount(for: d)
+            if autoTried.contains(key) || noCredChecked.contains(key) { continue }
+            // 必须先确认「有保存的凭据」才记入 autoTried。
+            // 旧版在这里就先写入 autoTried，于是「第一次插入时还没记住密码」的盘会被永久标记为
+            // 已尝试，之后哪怕保存了凭据（如重新锁定后再看）也永远不会再自动解锁。
+            guard let (method, cred) = loadCredential(for: d) else {
+                noCredChecked.insert(key)   // 确无凭据：本会话不再每 3 秒重复查一次钥匙串
                 continue
             }
+            autoTried.insert(key)
+            // 记住的 .BEK 文件若已被移走就跳过并清除，避免无谓的失败提示
+            if method == .bekFile && !FileManager.default.fileExists(atPath: cred) {
+                appLog("\(d.device) 记住的 BEK 文件已不存在，清除凭据")
+                forgetPassword(for: d)
+                continue
+            }
+            appLog("\(d.device) guid=\(d.guid) 找到凭据 method=\(methodCode(method))，尝试自动解锁")
             if unlockBitLocker(device: d.device, method: method, credential: cred) {
+                appLog("\(d.device) 自动解锁成功")
                 postNotification(title: "BitLocker 已自动解锁",
                                  body: "\(d.label) 已用记住的凭据解锁并挂载")
             } else {
+                appLog("\(d.device) 自动解锁失败，已清除保存的凭据")
                 postNotification(title: "BitLocker 自动解锁失败",
                                  body: "\(d.label)：保存的凭据已失效，已清除（请手动解锁）")
-                forgetPassword(for: d.device)
+                forgetPassword(for: d)
             }
             disks = listDisks()
             break
@@ -172,7 +216,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                                label: String(f[1]),
                                fs: String(f[2]),
                                mountPoint: String(f[3]),
-                               state: String(f[4])))
+                               state: String(f[4]),
+                               guid: f.count >= 6 ? String(f[5]) : ""))
         }
         return result
     }
@@ -404,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let d = sender.representedObject as? Disk else { return }
         guard let (pw, remember) = promptBitLockerPassword(label: d.label) else { return }
         if unlockBitLocker(device: d.device, method: .userPassword, credential: pw) {
-            if remember { saveCredential(pw, method: .userPassword, for: d.device) }
+            if remember { saveCredential(pw, method: .userPassword, for: d) }
             postNotification(title: "BitLocker 已解锁", body: "\(d.label) 已解锁并挂载为读写")
         }
         refresh()
@@ -414,7 +459,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         guard let d = sender.representedObject as? Disk else { return }
         guard let (rec, remember) = promptBitLockerRecovery(label: d.label) else { return }
         if unlockBitLocker(device: d.device, method: .recoveryPassword, credential: rec) {
-            if remember { saveCredential(rec, method: .recoveryPassword, for: d.device) }
+            if remember { saveCredential(rec, method: .recoveryPassword, for: d) }
             postNotification(title: "BitLocker 已解锁", body: "\(d.label) 已用恢复密码解锁并挂载为读写")
         }
         refresh()
@@ -437,7 +482,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     @objc private func actionForgetBL(_ sender: NSMenuItem) {
         guard let d = sender.representedObject as? Disk else { return }
-        forgetPassword(for: d.device)
+        forgetPassword(for: d)
         alert("已忘记凭据", "已从钥匙串删除 \(d.label) 保存的 BitLocker 凭据。")
         refresh()
     }
@@ -465,35 +510,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     // MARK: - 钥匙串（BitLocker 凭据记忆）
 
-    /// 记忆格式为 `<凭据>\n<方法码>`（u=用户密码 / r=恢复密码 / b=.BEK 路径）。
-    /// 方法码放在末尾，这样凭据本身含冒号或换行也不会被误解析。
-    private func saveCredential(_ credential: String, method: UnlockMethod, for device: String) {
-        run("/usr/bin/security", ["delete-generic-password", "-s", keychainService, "-a", device])
-        run("/usr/bin/security", ["add-generic-password", "-s", keychainService, "-a", device, "-w",
-                                  "\(credential)\n\(methodCode(method))"])
+    /// 该盘在钥匙串里使用的 account 键：优先用 BitLocker 卷 GUID（明文可读、跨插拔稳定），
+    /// 无 GUID（旧卷/读不到）时回退设备名。
+    /// 用设备名（diskXsY）做键是「记住密码后下次插入不自动解锁」的根因——
+    /// 每次插拔盘号都会变（disk4→disk6），键变了自然查不到旧条目。
+    private func keychainAccount(for disk: Disk) -> String {
+        disk.guid.isEmpty ? disk.device : disk.guid
     }
 
-    /// 读取已保存的凭据。旧版本保存的是纯密码（无方法码），按用户密码处理以兼容。
-    private func loadCredential(for device: String) -> (UnlockMethod, String)? {
-        let (code, out) = runWithStatus("/usr/bin/security",
-                                        ["find-generic-password", "-s", keychainService, "-a", device, "-w"])
-        guard code == 0 else { return nil }
-        let v = out.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !v.isEmpty else { return nil }
-        if let nl = v.lastIndex(of: "\n") {
-            let cred = String(v[v.startIndex..<nl])
-            switch String(v[v.index(after: nl)...]) {
+    /// 记忆格式：把 `<方法码><凭据>` 的 UTF-8 字节整体做十六进制编码后存入钥匙串，
+    /// account 键优先用卷 GUID（跨插拔稳定），无 GUID 时回退设备名。
+    private func saveCredential(_ credential: String, method: UnlockMethod, for disk: Disk) {
+        writeCredential(credential, method: method, account: keychainAccount(for: disk))
+        // 顺带清掉可能遗留的「按设备名」旧条目，避免同一凭据存两份
+        if !disk.guid.isEmpty { deleteCredential(account: disk.device) }
+        // 清掉本会话的「已尝试 / 已确认无凭据」标记，这样用户重新锁定该盘后仍会自动解锁
+        let keys = [keychainAccount(for: disk), disk.device]
+        for k in keys { autoTried.remove(k); noCredChecked.remove(k) }
+        appLog("已保存凭据 disk=\(disk.device) guid=\(disk.guid) method=\(methodCode(method))")
+    }
+
+    /// 读取已保存的凭据：先按 GUID 键查，查不到再按设备名查（兼容 v0.0.11 及以前保存的旧条目）
+    private func loadCredential(for disk: Disk) -> (UnlockMethod, String)? {
+        if let r = readCredential(account: keychainAccount(for: disk)) { return r }
+        if !disk.guid.isEmpty, let r = readCredential(account: disk.device) { return r }
+        return nil
+    }
+
+    /// 忘记凭据：GUID 键与设备名键都删（两种键都可能存在旧条目）
+    private func forgetPassword(for disk: Disk) {
+        deleteCredential(account: keychainAccount(for: disk))
+        if !disk.guid.isEmpty { deleteCredential(account: disk.device) }
+    }
+
+    /// 记忆格式：把 `<方法码><凭据>` 的 UTF-8 字节整体做十六进制编码后存入钥匙串。
+    /// 为什么必须十六进制编码：macOS 的 `security` 在值含控制字符（如换行）时，
+    /// 会把值存成十六进制文本，`find -w` 读出来也是那段十六进制文本。
+    /// 旧版用「密码\n方法码」做分隔，于是存进去的其实是 `39393939393939390a75`
+    /// ——「记住密码」失效的根因：读回来的不是密码，而是密码的十六进制文本。
+    /// 编码成纯可打印十六进制后，无论凭据含什么字节都不会再被 security 二次改写。
+    private func encodePayload(_ credential: String, method: UnlockMethod) -> String {
+        let payload = Array((methodCode(method) + credential).utf8)
+        return payload.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// 解码钥匙串里存的值。兼容三种写法：
+    ///   新格式 `<方法码><凭据>`（整体十六进制）—— 本版本写入口径
+    ///   旧格式 `<凭据>\n<方法码>`（经 security 二次十六进制）—— v0.0.11 及以前
+    ///   最旧格式 纯凭据（无方法码）—— 按用户密码处理
+    private func decodePayload(_ s: String) -> (UnlockMethod, String)? {
+        let chars = Array(s.lowercased())
+        guard chars.count >= 2, chars.count % 2 == 0 else { return nil }
+        var bytes: [UInt8] = []
+        var i = 0
+        while i < chars.count {
+            guard let b = UInt8(String(chars[i...(i + 1)]), radix: 16) else { return nil }
+            bytes.append(b)
+            i += 2
+        }
+        guard let str = String(bytes: bytes, encoding: .utf8), !str.isEmpty else { return nil }
+        // 新格式：首字符是方法码
+        let head = String(str.first!)
+        let tail = String(str.dropFirst())
+        switch head {
+        case "u": return tail.isEmpty ? nil : (.userPassword, tail)
+        case "r": return tail.isEmpty ? nil : (.recoveryPassword, tail)
+        case "b": return tail.isEmpty ? nil : (.bekFile, tail)
+        default: break
+        }
+        // 旧格式：最后一个换行之后是方法码
+        if let nl = str.lastIndex(of: "\n") {
+            let cred = String(str[str.startIndex..<nl])
+            switch String(str[str.index(after: nl)...]) {
             case "u": return cred.isEmpty ? nil : (.userPassword, cred)
             case "r": return cred.isEmpty ? nil : (.recoveryPassword, cred)
             case "b": return cred.isEmpty ? nil : (.bekFile, cred)
             default:  break
             }
         }
-        return (.userPassword, v)
+        return (.userPassword, str)   // 最旧格式：整串即凭据
     }
 
-    private func forgetPassword(for device: String) {
-        run("/usr/bin/security", ["delete-generic-password", "-s", keychainService, "-a", device])
+    private func writeCredential(_ credential: String, method: UnlockMethod, account: String) {
+        deleteCredential(account: account)
+        run("/usr/bin/security", ["add-generic-password", "-s", keychainService, "-a", account,
+                                  "-w", encodePayload(credential, method: method)])
+    }
+
+    private func deleteCredential(account: String) {
+        run("/usr/bin/security", ["delete-generic-password", "-s", keychainService, "-a", account])
+    }
+
+    /// 读取某 account 键的凭据。
+    /// 注意：不能对整串做 trimmingCharacters(.whitespacesAndNewlines)——那会连同
+    /// security 自己追加的结尾换行一起影响解析；这里只剥掉结尾换行再交给 decodePayload。
+    private func readCredential(account: String) -> (UnlockMethod, String)? {
+        let (code, out) = runWithStatus("/usr/bin/security",
+                                        ["find-generic-password", "-s", keychainService, "-a", account, "-w"])
+        guard code == 0 else { return nil }
+        var s = out
+        while s.hasSuffix("\n") || s.hasSuffix("\r") { s.removeLast() }
+        guard !s.isEmpty else { return nil }
+        let r = decodePayload(s)
+        appLog("readCredential(\(account)) 解析结果=\(r.map { "method=\(methodCode($0.0)) credLen=\($0.1.count)" } ?? "nil")")
+        return r
     }
 
     @objc private func actionOpen(_ sender: NSMenuItem) {
