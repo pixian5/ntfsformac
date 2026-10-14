@@ -89,7 +89,7 @@ ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.12）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁。
+菜单栏 App（v0.0.13）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁。
 
 v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
 导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
@@ -103,6 +103,7 @@ macOS 自带读写驱动只认块设备，故把解密文件用 `hdiutil` 附加
 v0.0.12 修复**「记住密码」完全失效**（三个叠加根因：`security` 会把含换行的值存成十六进制文本、
 钥匙串用会变的设备名做键、`autoTried` 标记时机错误），改用**卷 GUID**做键；
 并新增加密盘/杂项分区的**挂载前 NTFS 签名预检**，消除守护日志被非 NTFS 分区 `ntfs-3g` 失败刷屏。
+v0.0.13 补上验证中发现的 `lock` 未持互斥锁缺口（避免「解锁报成功、随即回退 locked」的假成功）。
 
 详情见 [docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md)。
 
@@ -130,7 +131,7 @@ v0.0.12 修复**「记住密码」完全失效**（三个叠加根因：`securit
 | [20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md](docs/20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md) | BitLocker 解锁/读写方案与验证全过程 |
 | [20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md](docs/20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md) | 真实 U 盘解锁失败根因：未知 datum 中断遍历（含诊断三件套） |
 | [20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md](docs/20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md) | BitLocker 内层 exFAT：hdiutil 原始镜像附加 + macOS 原生驱动挂载（真实 U 盘端到端） |
-| [20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md](docs/20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md) | 「记住密码」失效三根因（security hex 化 / 设备名做键 / autoTried 时机）+ 卷 GUID 键 + 挂载前签名预检 |
+| [20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md](docs/20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md) | 「记住密码」失效三根因（security hex 化 / 设备名做键 / autoTried 时机）+ 卷 GUID 键 + 挂载前签名预检 + lock 互斥锁缺口 |
 | [20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md](docs/20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md) | 恢复密码 / .BEK 文件解锁入口（含 dislocker 55 字符铁律） |
 | [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
 | [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划（P0/P1/P2 分级） |

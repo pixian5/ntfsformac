@@ -285,3 +285,13 @@ macOS 的 `security add-generic-password -w <值>` 在值含有**可打印 ASCII
 原因是 `$dev` 后面紧跟**全角冒号**（多字节 UTF-8），bash 解析变量名时把后续字节也算了进去。
 - 教训：变量后紧跟多字节字符（中文标点、中文词）时，一律用 `${var}` 界定：
   `log "跳过 ${dev}：..."`、`die "$dev 解密卷内层为 ${ifs}，暂不支持挂载"`。
+
+### 39. `lock` 必须与 `unlock`/挂载共享同一把互斥锁，否则出现「解锁假成功」
+`bl_lock_one`（`ntfsctl lock`）最初**没有**走 `lock_mount` 互斥锁，而 `bl_unlock_one` / `mount_one` 都走了。
+于是「锁定」可以和另一进程刚建立的解锁并发：`bl_close_container` 会把刚挂好的 dislocker-fuse 容器拆掉，
+表现为 **App 日志报「自动解锁成功」，但几秒后卷又变回 `locked`（且 dislocker-fuse 进程为 0）**。
+- 复现方式：同时（或紧接）发起 `ntfsctl lock` 与 App 自动解锁。实测因此误判过一次「自动解锁不生效」，
+  实为测试步骤自身造成的竞态。
+- 修复：`bl_lock_one` 全程持有 `lock_mount`（`trap 'unlock_mount' EXIT` 兜底）。
+- 启发：凡是会**改动同一设备挂载态**的子命令（lock / eject / mount / unmount）都应共享这把锁；
+  `eject_one` 目前仍未持锁，属已知遗留（见「下一步待实现」）。

@@ -418,10 +418,16 @@ bl_unlock_one() {
 bl_lock_one() {
   local dev="$1" label mp
   is_bitlocker "$dev" || { log "$dev 不是 BitLocker 卷"; return 0; }
+  # 必须与 unlock/挂载共享同一把互斥锁：否则「锁定」会与另一个进程刚建立的解锁容器并发，
+  # bl_close_container 可能把刚挂好的 dislocker-fuse 容器拆掉，出现「解锁报成功、随后又变回
+  # 已锁定」的假成功。实测曾因此复现（手动 lock 与 App 自动解锁同时发起）。
+  lock_mount || die "另一个挂载/解锁操作进行中，请稍后再试"
+  trap 'unlock_mount' EXIT
   label=$(bl_label "$dev")
   mp=$(mountpoint_of "$dev" "$label")
   [ -n "$mp" ] && unmount_one "$dev"
   bl_close_container "$dev"
+  unlock_mount; trap - EXIT
   log "已锁定: /dev/$dev"
 }
 
