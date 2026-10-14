@@ -98,7 +98,7 @@ else
   git clone --depth 1 --branch v0.7.3 https://github.com/Aorimn/dislocker.git "$DISLOCKER_SRC" \
     || die "clone dislocker 失败"
 
-  # 三个补丁：mbedTLS 3 兼容 + 链接 libfuse-t + 无条件用 FUSE-T 的 <fuse.h>
+  # 四个补丁：mbedTLS 3 兼容 + 链接 libfuse-t + 无条件用 FUSE-T 的 <fuse.h> + 未知 datum 跳过
   python3 - "$DISLOCKER_SRC" <<'PYEOF' || die "dislocker 源码补丁失败"
 import io, os, sys
 src = sys.argv[1]
@@ -133,6 +133,31 @@ patch('src/CMakeLists.txt', 'set (FUSE_LIB osxfuse_i64)', 'set (FUSE_LIB fuse-t)
 patch('src/dislocker-fuse.c',
       '#ifdef __DARWIN\n# include <osxfuse/fuse.h>\n#else\n# include <fuse.h>\n#endif /* __DARWIN */',
       '# include <fuse.h>')
+
+# 4) 未知 value_type 的 datum 不再中断遍历
+#    部分新式 Windows 卷的数据集里存在 value_type 超出本版本已知表
+#    (> NB_DATUMS_VALUE_TYPES) 的 datum（实测 Windows 写入 entry_type=46 / value_type=37）。
+#    get_header_safe() 对未知 value_type 返回 FALSE，原代码据此直接 break，
+#    会使位于其后的关键 datum —— FVEK(entry 3) 与 VIRTUALIZATION_INFO(value 15)
+#    永远读不到，最终在启动时报 "Unable to compute regions. Abort."（与密码对错无关）。
+#    改为：只要 datum_size 结构合法（>=8）就按声明大小跳过并继续遍历。
+_HDR_SKIP = (
+    '\t\t/* 未知 value_type 的 datum 不能中断遍历：其后可能还有 FVEK /\n'
+    '\t\t * VIRTUALIZATION_INFO，跳过它继续找（datum_size>=8 保证单调前进）。 */\n'
+    '\t\tmemcpy(&header, @V@, sizeof(datum_header_safe_t));\n'
+    '\t\tdis_printf(L_DEBUG, "Header safe: %#x, %#x, %#x, %#x\\n",\n'
+    '\t\t\theader.datum_size, header.entry_type, header.value_type, header.error_status);\n'
+    '\t\tif(header.datum_size < sizeof(datum_header_safe_t))\n'
+    '\t\t\tbreak;\n'
+)
+# 4a) 查找关键 datum 的遍历（FVEK / VIRTUALIZATION_INFO 依赖它）
+patch('src/metadata/datums.c',
+      '\t\tif(!get_header_safe(datum, &header))\n\t\t\tbreak;\n',
+      _HDR_SKIP.replace('@V@', 'datum'))
+# 4b) 诊断打印的遍历（ntfsctl info -v 能列出全部 datum，含未知类型）
+patch('src/metadata/print_metadata.c',
+      '\t\tif(!get_header_safe(data, &header))\n\t\t\tbreak;\n',
+      _HDR_SKIP.replace('@V@', 'data'))
 PYEOF
 
   # 注意：cmake 4.x 拒绝 cmake_minimum_required(<3.5)，用策略下限绕过

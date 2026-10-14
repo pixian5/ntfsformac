@@ -179,3 +179,25 @@ Swift 会把 **≤15 字节**的 UTF-8 字面量内联存储，不落在 `__TEXT
 - 例：`用密码解锁…`(18 字节) 找得到；`--bek`(5 字节)、`已忘记凭据`(15 字节) 找不到。
 - 正确做法：用 Python 逐字节 `bytes.count(s.encode('utf-8'))` 统计，并明确"找不到 ≠ 没编进去"。
   更可靠的等价验证是核对上游数据契约（如 `ntfsctl list --porcelain` 的字段数与含义）再做静态推理。
+
+### 29. dislocker 遇到「未知 value_type」的 datum 会中断整个遍历（真实 U 盘解锁失败根因）
+`src/metadata/datums.c` 的 `get_next_datum()` 用 `get_header_safe()` 校验每个 datum 头，
+而该函数在 `value_type > NB_DATUMS_VALUE_TYPES`（本版本已知表只到 22）时返回 FALSE，
+原代码据此 **`break` 掉整个遍历**（而不是跳过这一个）。
+- 后果：新式 Windows 卷里的未知 datum（实测 entry_type=46 / value_type=37）会挡住**它后面**的
+  `FVEK(entry 3)` 与 `VIRTUALIZATION_INFO(value 15)`，导致 `end_compute_regions()` 找不到 type 15 →
+  `Unable to compute regions. Abort.`。**这个错误与密码对错无关**（`ntfsctl info` 无凭据也报同样的错）。
+- 修复：改为读出 datum 头后，仅以 `datum_size >= sizeof(datum_header_safe_t)`(8) 为门槛继续遍历
+  （保证偏移单调前进不死循环），把未知 value_type 降级为「可跳过」。见
+  docs/20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md。
+- 顺带修 `print_metadata.c` 的 `print_data()` 同构循环，否则 `ntfsctl info -v` 也列不全 datum。
+
+### 30. 区分「元数据解析失败」与「凭据错误」的两类报错
+排查 BitLocker 解锁失败时，先看错误落在哪一层，能省掉大量试密码的时间：
+- **结构层**：`Unable to compute regions` / `找不到 VIRTUALIZATION datum type 15` → 解析器问题（见 #29）。
+- **凭据层**：`MAC check failed for AES-CCM key ...` → `Unable to get the VMK (error 0x800c0006)` →
+  `Can't initialize dislocker` → dislocker 已用凭据派生密钥并做了 AES-CCM 校验，**校验失败即凭据不匹配**。
+- 辅助判据：`ntfsctl info`（无凭据）若能成功列出全部 datum，则结构正常，问题在凭据；
+  若 `info` 也失败，则是解析/结构问题。
+- 排错工具三件套：`ntfsctl info -v`（datum 列表）、`ntfsctl dump`（导原始元数据副本离线核对）、
+  `ntfsctl unlock --verbose`（看它选了哪个 VMK / 用了什么盐值 / 哪种解密方式）。

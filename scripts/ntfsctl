@@ -522,7 +522,7 @@ case "$CMD" in
   unlock)
     shift
     UT="${1:-all}"; shift 2>/dev/null || true
-    PW_FILE=""; PW=""; REC=""; REC_FILE=""; BEK=""; CLEARKEY=""
+    PW_FILE=""; PW=""; REC=""; REC_FILE=""; BEK=""; CLEARKEY=""; VERBOSE=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --password-file) PW_FILE="${2:-}"; shift 2 ;;
@@ -531,6 +531,7 @@ case "$CMD" in
         --recovery)      REC="${2:-}"; shift 2 ;;
         --bek)           BEK="${2:-}"; shift 2 ;;
         --clearkey)      CLEARKEY=1; shift ;;
+        --verbose)       VERBOSE=1; shift ;;
         --)              shift; break ;;
         *)               break ;;
       esac
@@ -563,6 +564,9 @@ case "$CMD" in
     else
       die "缺少解锁凭据：请用 --password / --password-file / --recovery / --recovery-file / --bek / --clearkey"
     fi
+    # --verbose：把 dislocker 的调试日志打开（默认只打印 CRITICAL，
+    # 解锁失败时看不到「找到了哪个 VMK / 盐值 / 解密方式」等关键细节）
+    [ -n "$VERBOSE" ] && set -- -vv "$@"
     for dev in $(resolve_devices "$UT"); do
       bl_unlock_one "$dev" "$@"
     done
@@ -589,10 +593,60 @@ case "$CMD" in
       eject_one "$dev"
     done
     ;;
+  dump)
+    # 导出卷头与三份 BitLocker 元数据副本的原始字节（需 root），供离线分析元数据布局。
+    # 用法: ntfsctl dump <disk> [输出目录=/tmp/ntfsformac-dump]
+    # 用途：当某个卷 dislocker 解析失败（如报 Unable to compute regions）时，用它抓原始
+    # 元数据，再离线逐字节核对 datum 布局，判断是「卷本身缺 datum」还是「解析器提前中止」。
+    shift
+    DD="${1:-}"; [ -n "$DD" ] || die "用法: ntfsctl dump <disk> [输出目录]"; shift 2>/dev/null || true
+    DOUT="${1:-/tmp/ntfsformac-dump}"
+    DD="${DD#/dev/}"
+    is_bitlocker "$DD" || die "/dev/$DD 不是 BitLocker 卷"
+    as_root mkdir -p "$DOUT" || die "创建输出目录 $DOUT 失败"
+    # 卷头 512 字节
+    as_root dd if="/dev/r$DD" of="$DOUT/vol-header.bin" bs=512 count=1 2>/dev/null
+    # 先用 dislocker 自己的调试输出拿到三份元数据副本偏移与完整解析日志
+    L=$(as_root /usr/local/bin/dislocker-metadata -v -V "/dev/$DD" 2>&1)
+    printf '%s\n' "$L" > "$DOUT/metadata.log"
+    # information 块里也打印了这三个偏移，取最后一次出现（即 information 块的值）
+    idx=0
+    for key in First Second Third; do
+      off=$(printf '%s\n' "$L" | awk -v k="$key metadata header offset" 'index($0,k){v=$NF} END{print v}')
+      [ -n "$off" ] || continue
+      # 元数据副本固定 64KiB（0x10000），按 512B 扇区对齐读取
+      as_root dd if="/dev/r$DD" of="$DOUT/meta-copy$idx.bin" bs=512 skip=$((off/512)) count=128 2>/dev/null
+      idx=$((idx+1))
+    done
+    as_root chmod 644 "$DOUT"/*.bin 2>/dev/null || true
+    as_root chmod 644 "$DOUT/metadata.log" 2>/dev/null || true
+    log "已导出到 $DOUT（vol-header.bin + meta-copy*.bin + metadata.log）"
+    ;;
+  info)
+    # 读取 BitLocker 卷元数据（无需任何凭据）：加密算法、卷 GUID、保护器类型等。
+    # 元数据位于卷头且不含卷主密钥，因此不需要密码即可读取——用于诊断
+    # 「该卷到底配了哪些解锁方式（用户密码 / 恢复密码 / BEK）」，从而判断该用 -u 还是 -p。
+    # 加 -v 可输出 dislocker 调试级日志（含元数据偏移、datum 列表），用于排查解析失败。
+    shift
+    V=""
+    [ "${1:-}" = "-v" ] && { V="-v"; shift; }
+    IT="${1:-all}"
+    for dev in $(resolve_devices "$IT"); do
+      if ! is_bitlocker "$dev"; then
+        log "$dev 不是 BitLocker 卷（无 BitLocker 签名）"
+        continue
+      fi
+      log "== BitLocker 元数据: $dev =="
+      # 以 root 运行时直接读设备；非 root 时用免密提权（ntfsctl 通常由 sudo 调用，即已是 root）
+      as_root_np /usr/local/bin/dislocker-metadata $V -V "/dev/$dev" 2>&1 || true
+    done
+    ;;
   *)
     cat >&2 <<'USAGE'
 用法:
   ntfsctl list [--porcelain]                 列出 NTFS/BitLocker 盘及状态
+  ntfsctl info [-v] <disk|label|all>         读取 BitLocker 卷元数据（无需凭据，用于诊断；-v 输出调试日志）
+  ntfsctl dump <disk> [输出目录]             导出卷头与元数据副本原始字节（需 root，用于离线分析）
   ntfsctl mount   <disk|label|all>           挂载为读写
   ntfsctl unmount <disk|label|all>           卸载（不弹出）
   ntfsctl eject   <disk|label|all>           安全弹出
@@ -601,6 +655,7 @@ case "$CMD" in
      凭据: --password-file <路径> | --password <密码>
            --recovery-file <路径> | --recovery <48位恢复密码>
            --bek <BEK文件> | --clearkey
+           [--verbose] 输出 dislocker 调试日志（排查解锁失败）
   ntfsctl auto                               把所有盘挂为读写（daemon 调用）
 USAGE
     exit 2

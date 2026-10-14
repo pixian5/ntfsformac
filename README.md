@@ -70,7 +70,10 @@ ntfsctl eject disk4s1      # 安全弹出
 ntfsctl unlock disk4s1 --password-file /path/pw   # 用用户密码解锁 BitLocker 并挂载读写
 ntfsctl unlock disk4s1 --recovery 123456-123456-123456-123456-123456-123456-123456-123456
 ntfsctl unlock disk4s1 --bek /path/XXXXXXXX.BEK   # 用 BEK 恢复密钥文件解锁
+ntfsctl unlock disk4s1 --password 密码 --verbose  # 解锁失败时输出 dislocker 调试日志
 ntfsctl lock disk4s1       # 重新锁定 BitLocker（卸载 + 停止解密）
+ntfsctl info -v disk4s1    # 读 BitLocker 元数据（无需凭据，诊断用）
+ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线排错用）
 ```
 
 ## ⚠ 注意事项
@@ -83,14 +86,18 @@ ntfsctl lock disk4s1       # 重新锁定 BitLocker（卸载 + 停止解密）
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.9）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁、
-全量测试全绿。BitLocker 真实加密镜像盘端到端 29 项全绿。
+菜单栏 App（v0.0.10）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁。
+
+v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
+导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
+并新增诊断三件套 `ntfsctl info -v` / `ntfsctl dump` / `unlock --verbose`。
+BitLocker 加密镜像盘端到端 29 项全绿；真实 U 盘已能完整解析元数据、错误已收敛到「凭据层」。
 
 详情见 [docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md)。
 
 ## 下一步待实现
 
-优先级最高的三件事：物理 BitLocker 盘压测、卸载脚本、pkg 安装器；另有开机自启、事件通知等规划。
+优先级最高的三件事：物理 BitLocker 盘成功解锁压测（缺真实凭据）、卸载脚本、pkg 安装器；另有开机自启、事件通知等规划。
 
 详情见 [docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md)。
 
@@ -111,6 +118,7 @@ NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含
 | [driver-install.md](docs/driver-install.md) | 驱动安装 / 重装 / 卸载手册 |
 | [20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md](docs/20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md) | BitLocker 解锁/读写方案与验证全过程 |
 | [20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md](docs/20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md) | 恢复密码 / .BEK 文件解锁入口（含 dislocker 55 字符铁律） |
+| [20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md](docs/20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md) | 真实 U 盘解锁失败根因：未知 datum 中断遍历（含诊断三件套与盘结构差异对照） |
 | [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
 | [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划（P0/P1/P2 分级） |
 
