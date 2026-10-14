@@ -20,15 +20,28 @@ trace() { [ "$DEBUG" = "1" ] && printf '[trace] %s\n' "$*" >&2; }
 die()   { printf '[ntfsctl] 错误: %s\n' "$*" >&2; exit 1; }
 log()   { printf '[ntfsctl] %s\n' "$*"; }
 
-# root 下直接执行，否则走 sudo（终端会提示密码）
+# ---------- 零弹窗提权（铁律：任何路径都绝不弹 Touch ID / 密码框） ----------
+# 背景：曾用交互式 `sudo "$@"`，非 root 场景下会请求 Touch ID 指纹，用户被反复弹窗。
+# 修复分两层：
+#   ① 脚本开头（见下方「免密重入」）：用户在终端裸跑安装版 ntfsctl 时，自动以
+#      `sudo -n /usr/local/bin/ntfsctl <原参数>` 重新调用自身 —— sudoers 白名单放行了
+#      ntfsctl 的任意参数，因此免密成功，体验与 root 直跑完全一致；
+#   ② as_root 改为非交互（sudo -n）：免密不可用时**直接失败**，绝不转入交互认证。
 as_root() {
-  if [ "$(id -u)" = "0" ]; then "$@"; else sudo "$@"; fi
+  if [ "$(id -u)" = "0" ]; then "$@"; else sudo -n "$@"; fi
 }
 
 # 仅在免密可用时提权（绝不弹密码框）：非 root 且 sudo -n 不可用时直接失败
 as_root_np() {
   if [ "$(id -u)" = "0" ]; then "$@"; else sudo -n "$@"; fi
 }
+
+# 免密重入：非 root 运行「安装版」ntfsctl 时，以 sudo -n 重新调用自身。
+# 只对 $0 == /usr/local/bin/ntfsctl 生效（源码路径不在 sudoers 白名单，重入无意义）；
+# sudo -n 失败（免密不可用）会打印 "a password is required" 并退出 —— 宁可失败也不弹指纹。
+if [ "$(id -u)" != "0" ] && [ "${NTFSCTL_REENTERED:-}" != "1" ] && [ "$0" = "/usr/local/bin/ntfsctl" ]; then
+  NTFSCTL_REENTERED=1 exec sudo -n "$0" "$@"
+fi
 
 # ---------- 设备枚举：diskutil list → 每个 NTFS 设备 ----------
 # 输出: device|label（多行，仅 NTFS）
@@ -61,6 +74,271 @@ ntfs_devices() {
       [ "$skip" = "1" ] && continue
       printf '%s %s\n' "$dev" "$label"
     done
+}
+
+# ---------- 分区/文件系统探测（诊断用；读裸设备需 root） ----------
+# 用法: ntfsctl probe <disk|diskXsY>...
+# 目的：把「磁盘上真实存在什么分区」如实打印出来（分区类型 / 首扇区签名 / 推断的文件系统）。
+# 为什么需要它：ntfs_devices 只认 Windows_NTFS 与 Microsoft Basic Data 两种分区类型，
+# 其它类型（如 Ventoy 的 0xEF EFI 分区、0x07 旧式 NTFS）会被**静默忽略**，
+# 用户就会反馈「某个分区没检测到」。排查这类问题必须先能看到原始的扇区信息。
+# 签名位置：FAT 家族（NTFS/exFAT/FAT）在首扇区偏移 3 起 8 字节放 OEM 名；
+#           FAT12/16 的类型串在偏移 0x36，FAT32 的在 0x52；APFS 的 "NXSB" 在偏移 32。
+
+# 由整扇区十六进制串推断文件系统类型（纯字符串运算，bash 3.2 兼容）
+probe_guess() {
+  local hex="$1" sig t16 t32
+  sig=$(printf '%s' "$hex" | cut -c7-22)          # 偏移 3 起 8 字节（每字节 2 个 hex 字符，1-based）
+  case "$sig" in
+    4e54465320202020) echo "NTFS"; return ;;
+    2d4656452d46532d) echo "BitLocker（-FVE-FS-，经典整卷加密）"; return ;;
+    4d5357494e342e31) ;;                          # MSWIN4.1：FAT 家族与 BitLocker-To-Go 共用，需看 BPB 分辨
+    4558464154202020) echo "exFAT"; return ;;
+  esac
+  # BPB 类型串：偏移 0x36(54) 为 FAT12/FAT16；偏移 0x52(82) 为 FAT32
+  t16=$(printf '%s' "$hex" | cut -c109-124 | xxd -r -p 2>/dev/null)
+  t32=$(printf '%s' "$hex" | cut -c165-180 | xxd -r -p 2>/dev/null)
+  case "$t32" in FAT32*) echo "FAT32"; return ;; esac
+  case "$t16" in FAT12*|FAT16*) echo "$t16"; return ;; esac
+  # APFS 的 "NXSB" 在偏移 32
+  [ "$(printf '%s' "$hex" | cut -c65-72)" = "4e585342" ] && { echo "APFS"; return; }
+  case "$sig" in
+    4d5357494e342e31) echo "FAT 家族（OEM=MSWIN4.1，BPB 未能确认具体类型）"; return ;;
+  esac
+  echo "未知（未格式化 / raw / 非标准分区）"
+}
+
+probe_one() {
+  local dev="$1" ptype hex sig_hex sig_asc guess
+  ptype=$(diskutil info "/dev/$dev" 2>/dev/null | awk -F': *' '/Partition Type/{print $2; exit}')
+  [ -n "$ptype" ] || ptype="(未知)"
+  # 一次读出整扇区的十六进制串（经 od 转文本，避免 bash 变量丢失 NUL 字节并刷警告）
+  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  if [ -z "$hex" ]; then
+    printf '%s  分区类型=%-14s  无法读取（无读权限、设备不存在或已被独占）\n' "$dev" "$ptype"
+    return 1
+  fi
+  sig_hex=$(printf '%s' "$hex" | cut -c7-22)
+  sig_asc=$(printf '%s' "$sig_hex" | xxd -r -p 2>/dev/null | tr -c '[:print:]' '.')
+  guess=$(probe_guess "$hex")
+  printf '%s  分区类型=%-14s 首扇区签名=%s [%s]  → %s\n' "$dev" "$ptype" "$sig_hex" "$sig_asc" "$guess"
+}
+
+# 探测目标：整盘（disk25）则枚举其全部分区；分区（disk25s2）则直接探测
+probe_target() {
+  local t="$1" d
+  case "$t" in
+    disk[0-9]*)
+      if [ -e "/dev/${t}s1" ]; then
+        # 只取「分区行」（形如 `   1:   Windows_NTFS   16.3 GB   disk25s1`）的最后一列，
+        # 不能匹配整盘标题行 `/dev/disk25 (external, physical):`，否则会把 "physical):" 当设备名
+        for d in $(diskutil list "$t" 2>/dev/null | awk '/^ *[0-9]+:/{print $NF}'); do probe_one "$d"; done
+      else
+        probe_one "$t"
+      fi
+      ;;
+    *) probe_one "$t" ;;
+  esac
+}
+
+# ---------- 其它外置分区（非 NTFS/BitLocker）：检测 + 「裸镜像」只读浏览 ----------
+# 起因（用户反馈）：优盘有多个分区，「另一个没加密的分区没检测到」。原因有两层：
+#   ① ntfs_devices 只匹配 Windows_NTFS / Microsoft Basic Data 两种分区类型，其它类型被静默忽略；
+#   ② 有些类型（如 Ventoy 的 0xEF EFI 分区里放的 FAT16）**macOS 自己也拒绝挂载** ——
+#      diskutil 的分区扫描只对特定类型尝试识别文件系统，于是显示 "no file system"，
+#      mount_msdos 也返回 ENOTSUP（实测 Operation not supported by device）。
+#      而 fsck_msdos 检查是通过的（该分区里实有 1014 个文件），说明文件系统本身完全正常。
+# 对策：① 先让它「看得到」（other_devices 枚举 + list 展示）；
+#       ② 挂载走「裸镜像附加」：把分区内容 dd 成镜像文件后用 hdiutil attach，
+#          该镜像设备**没有分区表**，macOS 只能按内容识别 → 实测被识别为 MS-DOS FAT16 并正常挂载。
+# 为什么不用「把分区类型 0xEF 改成 0x0E」让 macOS 直接挂载原分区？**绝对不能做**：
+#   UEFI 固件靠 0xEF 这个类型定位 EFI 分区，改了会让该 U 盘再也无法 UEFI 启动（Ventoy 直接失效）。
+# 代价：镜像挂的是「副本」，写入不会回写原分区 → 因此一律用 -readonly **只读挂载**，
+#       用户若尝试写入会被 macOS 直接拒绝（明确报错），不存在「写了却静默丢失」的风险。
+RAW_DIR=/var/run/ntfsformac/raw-image
+
+# 读首扇区签名判定文件系统短名：ntfs/bitlocker/exfat/fat32/fat12/fat16/apfs/other/unreadable
+# （与 probe_guess 同源，但这里返回可供程序判断的短名；probe_guess 返回给人看的中文描述）
+fs_type_of() {
+  local dev="$1" hex sig t16 t32
+  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  [ -n "$hex" ] || { printf 'unreadable'; return; }
+  sig=$(printf '%s' "$hex" | cut -c7-22)
+  case "$sig" in
+    4e54465320202020) printf 'ntfs';      return ;;
+    2d4656452d46532d) printf 'bitlocker'; return ;;
+    4558464154202020) printf 'exfat';     return ;;
+  esac
+  # BPB 类型串：FAT32 在偏移 0x52(82)，FAT12/16 在偏移 0x36(54)
+  t32=$(printf '%s' "$hex" | cut -c165-180 | xxd -r -p 2>/dev/null)
+  case "$t32" in FAT32*) printf 'fat32'; return ;; esac
+  t16=$(printf '%s' "$hex" | cut -c109-124 | xxd -r -p 2>/dev/null)
+  case "$t16" in
+    FAT12*) printf 'fat12'; return ;;
+    FAT16*) printf 'fat16'; return ;;
+  esac
+  [ "$(printf '%s' "$hex" | cut -c65-72)" = "4e585342" ] && { printf 'apfs'; return; }
+  case "$sig" in
+    # MSWIN4.1：FAT 家族与 BitLocker-To-Go 共用该 OEM 名。是 BitLocker-To-Go 的会被
+    # is_bitlocker 先拦下（不进入本函数的结果消费方），所以这里按 FAT 家族处理
+    4d5357494e342e31) printf 'fat'; return ;;
+  esac
+  printf 'other'
+}
+
+# 该设备是否走「其它分区」路径（既非 NTFS 也非 BitLocker，且能读到内容）
+is_raw_partition() {
+  case "$(fs_type_of "$1")" in
+    ntfs|bitlocker|apfs|unreadable) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# 从 FAT 引导扇区（BPB）读卷标。macOS 因分区类型不识别文件系统时，diskutil 给不出卷名
+# （显示 "Not applicable (no file system)"），只能自己读：
+#   FAT12/FAT16 卷标在偏移 0x2B(43) 起 11 字节；FAT32 在偏移 0x47(71) 起 11 字节
+raw_label() {
+  local dev="$1" fs="$2" hex off
+  case "$fs" in
+    fat32)       off=71 ;;
+    fat12|fat16) off=43 ;;
+    *)           return ;;
+  esac
+  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  [ -n "$hex" ] || return
+  printf '%s' "$hex" | cut -c $((off * 2 + 1))-$(((off + 11) * 2)) \
+    | xxd -r -p 2>/dev/null | tr -d '\000' | sed 's/[[:space:]]*$//'
+}
+
+# 外置盘上的「其它分区」：输出 dev|label|fs。
+# 只取外置盘（Device Location: External）。过滤规则（三条都要满足）：
+#   ① 不在 ntfs_devices 里（NTFS/BitLocker 已单独展示，本函数只管「其它」）；
+#   ② 当前没有被 macOS 原生挂载（已挂上的说明本来就检测得到，再列一次是重复噪音）；
+#   ③ 内容是 FAT 家族（fat12/fat16/fat32/exfat）—— 这正是「macOS 因分区类型拒绝识别」的高发场景
+#      （如 Ventoy 的 0xEF 分区里放 FAT16）。ext4/HFS+ 等本地不认的格式一律排除，避免误挂。
+other_devices() {
+  local dev label fs ntfs_list
+  ntfs_list=" $(ntfs_devices 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
+  for dev in $(
+    diskutil list 2>/dev/null | awk '
+      /^\/dev\/disk[0-9]+/ { external = ($0 ~ /external/) ; next }   # 整盘标题行：记住是否外置
+      /^ *[0-9]+:/         { if (external) print $NF }              # 分区行：取最后一列(identifier)
+    '
+  ); do
+    [ -n "$dev" ] || continue
+    [ -e "/dev/$dev" ] || continue
+    case "$ntfs_list" in *" $dev "*) continue ;; esac          # ① NTFS/BitLocker 已单独展示
+    /sbin/mount 2>/dev/null | grep -qF "/dev/$dev on " && continue  # ② 已被原生挂载
+    fs=$(fs_type_of "$dev")
+    case "$fs" in
+      fat12|fat16|fat32|exfat) ;;                              # ③ 只收 FAT 家族
+      *) continue ;;
+    esac
+    label=$(raw_label "$dev" "$fs")
+    [ -n "$label" ] || label="$fs-$dev"
+    printf '%s|%s|%s\n' "$dev" "$label" "$fs"
+  done
+}
+
+# 该分区镜像附加出来的设备标识（如 disk27）；未附加则空
+raw_image_dev() { cat "$RAW_DIR/$1" 2>/dev/null; }
+
+# 镜像设备的当前挂载点（未挂载则空）
+raw_mp() {
+  local idev; idev=$(raw_image_dev "$1")
+  [ -n "$idev" ] || return
+  /sbin/mount 2>/dev/null | grep -F "/dev/$idev on " | head -1 | sed 's/^.* on //; s/ (.*$//'
+}
+
+# 只读挂载「其它分区」：dd 导出内容为免分区表镜像 → 以 GUI 属主身份附加 → 由 macOS 按内容识别挂载
+raw_mount_one() {
+  local dev="$1" fs img owner out idev i mp
+  fs=$(fs_type_of "$dev")
+  case "$fs" in
+    ntfs|bitlocker|apfs|unreadable) die "/dev/${dev} 的类型是 ${fs}，不走「其它分区」路径" ;;
+  esac
+  lock_mount || die "另一个挂载/解锁操作进行中，请稍后再试"
+  trap 'unlock_mount' EXIT
+  mp=$(raw_mp "$dev")
+  [ -n "$mp" ] && { log "/dev/${dev} 已挂载（${mp}），跳过"; unlock_mount; trap - EXIT; return 0; }
+  raw_detach_one "$dev"        # 清掉上次可能没摘干净的旧镜像设备，避免叠加挂两份
+  owner=$(resolve_owner); [ -n "$owner" ] || owner=$(id -un)
+  as_root mkdir -p "$RAW_DIR" 2>/dev/null || true
+  img="$RAW_DIR/${dev}.img"
+  as_root rm -f "$img" 2>/dev/null || true
+  # 导出分区内容（只读拷贝，33MB 级实测约 1.4 秒）
+  as_root_np dd if="/dev/$dev" of="$img" bs=1m 2>/dev/null || die "导出 /dev/$dev 内容失败"
+  # 镜像交给 GUI 属主，这样后续以属主身份附加、挂载点归属该用户（否则普通用户访问不了 700 权限的卷）
+  as_root chown "$owner" "$img" 2>/dev/null || true
+  as_root chmod 600 "$img" 2>/dev/null || true
+  # -readonly：整个挂载只读；noverify：跳过校验（内容是我们刚导出的干净拷贝，无需再校验）
+  out=$(as_root su -l "$owner" -c "hdiutil attach -readonly -noverify \
+      -imagekey diskimage-class=CRawDiskImage '$img'" 2>&1)
+  idev=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/{print $1}' | tail -1)
+  if [ -z "$idev" ]; then
+    log "$out"
+    as_root rm -f "$img" 2>/dev/null || true
+    die "镜像附加失败（无法把分区内容附加为块设备）"
+  fi
+  printf '%s' "${idev#/dev/}" > "$RAW_DIR/$dev"
+  unlock_mount; trap - EXIT
+  # 等挂载就绪（附加后 macOS 异步挂载，通常 1 秒内）
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    mp=$(raw_mp "$dev")
+    [ -n "$mp" ] && break
+    sleep 0.5
+  done
+  mp=$(raw_mp "$dev")
+  if [ -n "$mp" ]; then
+    log "已挂载（只读）: /dev/${dev}（${fs}） → ${mp}"
+    log "提示: 这是分区内容的只读副本，写入不会回写原分区（如需写入请用 Windows）"
+  else
+    log "已附加镜像设备 /dev/${idev}，但 macOS 未挂载（可能该分区不是可识别的文件系统）"
+  fi
+}
+
+# 卸载「其它分区」：卸挂载 + 摘镜像设备 + 删除临时镜像文件
+raw_detach_one() {
+  local dev="$1" idev mp img i
+  idev=$(raw_image_dev "$dev")
+  img="$RAW_DIR/${dev}.img"
+  [ -n "$idev" ] || [ -e "$img" ] || return 0
+  mp=$(raw_mp "$dev")
+  as_root sync 2>/dev/null || true
+  if [ -n "$mp" ]; then
+    as_root diskutil unmount force "$mp" >/dev/null 2>&1 \
+      || as_root umount -f "$mp" 2>/dev/null || true
+  fi
+  as_root sync 2>/dev/null || true
+  if [ -n "$idev" ]; then
+    # 卸卷后 macOS 常会把「无分区表的裸镜像设备」一起自动摘下，此时 diskutil eject 可能
+    # 报「无此设备」。故这里既不把失败当错误，也不急着告警，而是轮询等设备消失后再判定。
+    for i in 1 2 3 4 5 6 7 8; do
+      [ -e "/dev/$idev" ] || break
+      as_root diskutil eject "/dev/$idev" >/dev/null 2>&1 \
+        || as_root hdiutil detach "/dev/$idev" -force >/dev/null 2>&1 || true
+      sleep 0.5
+    done
+    [ -e "/dev/$idev" ] && log "警告: 镜像设备 /dev/$idev 未能摘下"
+  fi
+  as_root rm -f "$RAW_DIR/$dev" 2>/dev/null || true
+  as_root rm -f "$img" 2>/dev/null || true
+  # 镜像文件曾被「摘除动作尚未完成时被删除又重建」过，故再确认一次，彻底清干净
+  [ -e "$img" ] && as_root rm -f "$img" 2>/dev/null || true
+  trace "raw: 已卸载并摘下 $dev 的只读镜像"
+}
+
+# 摘下某父盘（如 disk25）下所有「其它分区」的只读镜像。
+# 由 eject_one 在弹出父盘前调用：否则镜像设备会残留（磁盘工具里显示幽灵磁盘，
+# 且父盘被弹出后镜像仍指向已消失的数据）。
+raw_detach_parent() {
+  local parent="$1" rec d
+  for rec in "$RAW_DIR"/disk*; do
+    [ -e "$rec" ] || continue
+    d="${rec##*/}"
+    case "$d" in *.img) continue ;; esac    # 跳过镜像本体，只处理「设备→镜像设备」记录文件
+    case "$d" in "$parent"*) raw_detach_one "$d" ;; esac
+  done
 }
 
 # 在 /sbin/mount 输出中查找设备或 FUSE-T 卷的挂载行。
@@ -121,17 +399,23 @@ resolve_devices() {
   [ "$target" = "all" ] && { ntfs_devices | awk '{print $1}'; return; }
   if [ -b "/dev/$target" ]; then echo "$target"; return; fi
   if printf '%s' "$target" | grep -qE '^disk[0-9]+(s[0-9]+)?$'; then echo "$target"; return; fi
-  # 按 label 匹配
+  # 按 label 匹配（先 NTFS，再「其它分区」的 FAT 卷标）
   ntfs_devices | while IFS=' ' read -r dev label; do
+    [ "$label" = "$target" ] && echo "$dev"
+  done
+  other_devices | while IFS='|' read -r dev label fs; do
     [ "$label" = "$target" ] && echo "$dev"
   done
   return 0
 }
 
 label_of() {
-  local dev="$1"
+  local dev="$1" l
   # label 可能含空格：去掉第一列设备名后整行输出
-  ntfs_devices | awk -v d="$dev" '$1==d { sub(/^[^ ]+ /, ""); print; exit }'
+  l=$(ntfs_devices | awk -v d="$dev" '$1==d { sub(/^[^ ]+ /, ""); print; exit }')
+  if [ -n "$l" ]; then printf '%s' "$l"; return; fi
+  # 非 NTFS/BitLocker 的「其它分区」：macOS 不识别其文件系统、diskutil 给不出卷名，改从 FAT BPB 读
+  other_devices | awk -F'|' -v d="$dev" '$1==d {print $2; exit}'
 }
 
 # ==================== BitLocker（加密卷）支持 ====================
@@ -670,6 +954,12 @@ unmount_competitors() {
 # ---------- 卸载 ----------
 unmount_one() {
   local dev="$1" label mp
+  # 「其它分区」（非 NTFS/BitLocker）走只读裸镜像路径：卸载 = 摘挂载 + 摘镜像设备 + 删临时镜像
+  if is_raw_partition "$dev"; then
+    raw_detach_one "$dev"
+    log "已卸载（其它分区只读副本）: $dev"
+    return 0
+  fi
   if is_bitlocker "$dev"; then label=$(bl_label "$dev"); else label=$(label_of "$dev"); fi
   mp=$(mountpoint_of "$dev" "$label")
   if [ -z "$mp" ]; then log "未挂载: $dev"; return 0; fi
@@ -701,6 +991,12 @@ eject_one() {
   # （典型后果：刚 eject 完的盘又被挂回来、或 dislocker 容器半拆状态导致下次解锁失败）。
   lock_mount || die "另一个挂载/卸载操作进行中，请稍后再试"
   trap 'unlock_mount' EXIT
+
+  # 0. 先摘下「其它分区」的只读镜像：本设备自己的那份 + 同父盘其它分区的那份。
+  #    必须赶在 diskutil eject 父盘之前，否则镜像设备会残留成「幽灵磁盘」。
+  #    （raw_detach_* 不再单独取锁，此处已持锁，避免自锁死。）
+  is_raw_partition "$dev" || raw_detach_one "$dev"
+  raw_detach_parent "$parent"
 
   # 1. eject marker（防 daemon 立即重挂）
   as_root mkdir -p "$MARKER_DIR" 2>/dev/null || true
@@ -802,6 +1098,19 @@ case "$CMD" in
         printf '%-10s %-22s %-9s %-7s %s\n' "$dev" "$label" "$fs" "$st" "$mp"
       fi
     done
+    # 「其它分区」（非 NTFS/BitLocker 的外置分区，如 Ventoy 的 VTOYEFI）也一并列出，
+    # 否则用户会以为「某个分区没检测到」。挂载走只读裸镜像路径（raw_mount_one），
+    # 因此这里的状态只可能是 ro（已挂只读副本）或 none；guid 恒为空。
+    other_devices | while IFS='|' read -r dev label fs; do
+      [ -n "$dev" ] || continue
+      mp=$(raw_mp "$dev")
+      if [ -n "$mp" ]; then st=ro; else st=none; fi
+      if [ -n "$PORCELAIN" ]; then
+        printf '%s|%s|%s|%s|%s|%s\n' "$dev" "$label" "$fs" "$mp" "$st" ""
+      else
+        printf '%-10s %-22s %-9s %-7s %s\n' "$dev" "$label" "$fs" "$st" "$mp"
+      fi
+    done
     ;;
   unlock)
     shift
@@ -864,7 +1173,14 @@ case "$CMD" in
     [ "$CMD" = "auto" ] && TARGET="all"
     [ "$TARGET" = "all" ] && { [ -z "$(ntfs_devices)" ] && { log "没有检测到 NTFS 盘"; exit 0; }; }
     for dev in $(resolve_devices "$TARGET"); do
-      mount_one "$dev"
+      # 「其它分区」走只读裸镜像路径；守护进程的 auto 不自动挂它 ——
+      # 否则每次插盘都会凭空多出一个只读副本卷（用户可用 ntfsctl mount <dev> 或 App 菜单显式挂载）
+      if is_raw_partition "$dev"; then
+        [ "$CMD" = "auto" ] && continue
+        raw_mount_one "$dev"
+      else
+        mount_one "$dev"
+      fi
     done
     ;;
   unmount)
@@ -925,14 +1241,22 @@ case "$CMD" in
       as_root_np /usr/local/bin/dislocker-metadata $V -V "/dev/$dev" 2>&1 || true
     done
     ;;
+  probe)
+    shift
+    [ $# -gt 0 ] || die "用法: ntfsctl probe <disk|diskXsY>...（例如 ntfsctl probe disk25）"
+    for t in "$@"; do probe_target "$t"; done
+    ;;
   *)
     cat >&2 <<'USAGE'
 用法:
-  ntfsctl list [--porcelain]                 列出 NTFS/BitLocker 盘及状态
+  ntfsctl list [--porcelain]                 列出 NTFS/BitLocker 盘及其它外置分区（FAT 家族）及状态
+  ntfsctl probe <disk|diskXsY>...            探测分区类型与首扇区签名（诊断「某分区没检测到」用）
   ntfsctl info [-v] <disk|label|all>         读取 BitLocker 卷元数据（无需凭据，用于诊断；-v 输出调试日志）
   ntfsctl dump <disk> [输出目录]             导出卷头与元数据副本原始字节（需 root，用于离线分析）
-  ntfsctl mount   <disk|label|all>           挂载为读写
-  ntfsctl unmount <disk|label|all>           卸载（不弹出）
+  ntfsctl mount   <disk|label|all>           挂载为读写；若目标是「其它分区」（FAT 家族、macOS 因分区类型拒绝挂载，
+                                             如 Ventoy 的 VTOYEFI），则改为只读浏览：把分区内容导出成免分区表
+                                             镜像再附加，macOS 按内容识别后挂载。注意这是副本，写入不会回写原分区
+  ntfsctl unmount <disk|label|all>           卸载（不弹出）；「其它分区」则同时摘下只读镜像
   ntfsctl eject   <disk|label|all>           安全弹出
   ntfsctl lock    <disk|label|all>           锁定 BitLocker 卷并卸载
                                              同时落下 /var/run/ntfsformac/locked.<dev> 标记，

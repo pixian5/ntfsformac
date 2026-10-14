@@ -62,6 +62,11 @@ while true; do
     # eject 中 → 跳过
     [ -e "$MARKER_DIR/ejecting.$dev" ] && continue
 
+    # 「其它分区」（fs 非 ntfs/bitlocker，如 Ventoy 的 VTOYEFI）不参与自动挂载：
+    # 它的挂载是「分区内容的只读副本」，只能由用户显式触发（ntfsctl mount <dev> / App 菜单）。
+    # 若也自动挂，则每个外置盘的 EFI/引导 FAT 分区都会被自动挂出来，噪音很大。
+    case "$fs" in ntfs|bitlocker) ;; *) continue ;; esac
+
     case "$state" in
       rw)
         # 检查是否又有只读寄生虫（Tahoe FSKit 会反复挂）

@@ -92,7 +92,7 @@ ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.14）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
+菜单栏 App（v0.0.15）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
 
 v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
 导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
@@ -118,13 +118,22 @@ v0.0.14 解决用户反馈的三件事：
 导致 **BitLocker 行**（guid 非空）的 `state` 被污染成 `rw|<guid>`、分支失配（已改为 6 字段 + `_rest` 兜底）；
 NTFS 行因 bash 会剥掉行尾空字段而不受影响（详见 known-issues #40/#44 —— 初版结论曾因用 zsh 复现而出错）。
 
-详情见 [docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md)。
+v0.0.15 解决两件事：
+① **其它分区检测 + 只读浏览**：外置盘上非 NTFS/BitLocker 的 FAT 家族分区（如 Ventoy 的 VTOYEFI，
+   分区类型 0xEF 被 macOS 拒绝识别）现在能被 `list` 列出，`ntfsctl mount <dev>` 走「dd 导出 →
+   免分区表镜像附加」只读浏览（写入不会回写原分区），`unmount`/`eject` 全闭环清理；
+   **绝不改分区表类型**（改 0xEF 会让 Ventoy 无法 UEFI 启动）。
+② **根除 Touch ID 指纹弹窗**：ntfsctl 的 `as_root` 从交互式 sudo 改为非交互（`sudo -n`，
+   免密不可用直接失败），并新增「裸跑免密重入」——终端直接跑 `ntfsctl ...` 自动经白名单提权，
+   实测 list/mount/unmount 全链路零弹窗。
+
+详情见 [docs/20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md)。
 
 ## 下一步待实现
 
-优先级最高的三件事：物理 BitLocker 盘端到端压测（**已在真实 U 盘 exFAT 卷完成**，NTFS 内层待验）、卸载脚本、pkg 安装器；另有开机自启、事件通知等规划。
+install-driver.sh 免密化、大分区镜像挂载的体积/耗时提示、ext4 浏览、ErrorPanel 保存到文件等。
 
-详情见 [docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md)。
+详情见 [docs/20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md)。
 
 ## 开发
 
@@ -147,8 +156,11 @@ NTFS 行因 bash 会剥掉行尾空字段而不受影响（详见 known-issues #
 | [20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md](docs/20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md) | 「记住密码」失效三根因（security hex 化 / 设备名做键 / autoTried 时机）+ 卷 GUID 键 + 挂载前签名预检 + lock 互斥锁缺口 |
 | [20261015-0045-报错弹窗重构与手动锁定标记-DeepSeek-V4.1-Flash.md](docs/20261015-0045-报错弹窗重构与手动锁定标记-DeepSeek-V4.1-Flash.md) | 报错弹窗改可复制非阻塞 NSPanel + eject 互斥锁 + 手动锁定标记（含竞态修正）+ porcelain 6 字段回归 |
 | [20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md](docs/20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md) | 恢复密码 / .BEK 文件解锁入口（含 dislocker 55 字符铁律） |
-| [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
-| [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划（P0/P1/P2 分级） |
+| [20261015-0745-其它分区检测与只读镜像挂载-DeepSeek-V4.1-Flash.md](docs/20261015-0745-其它分区检测与只读镜像挂载-DeepSeek-V4.1-Flash.md) | 其它分区（VTOYEFI 等）检测与只读裸镜像挂载 + 根除 Touch ID 指纹弹窗（免密重入） |
+| [20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
+| [20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划 |
+| [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 历史里程碑（v0.0.12 阶段） |
+| [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 历史计划（P0/P1/P2 分级） |
 
 ## 许可
 

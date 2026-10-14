@@ -300,17 +300,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private func makeDiskItem(_ disk: Disk) -> NSMenuItem {
         // 手动锁定（命令行 ntfsctl lock 或菜单锁定）会让 App 停止自动解锁，菜单里明示出来
         let manualLocked = disk.state == "locked" && isManuallyLocked(disk)
+        // 「其它分区」：非 NTFS/BitLocker 的外置分区（如 Ventoy 的 VTOYEFI）。
+        // 这类分区 macOS 因分区类型拒绝挂载，ntfsctl 改走「只读裸镜像」路径（挂的是内容副本，
+        // 写入不回写原盘），语义与普通盘的读写挂载不同，菜单需区别对待。
+        let isOther = disk.fs != "ntfs" && disk.fs != "bitlocker"
         let tag: String
-        switch disk.state {
-        case "rw":     tag = "● RW"
-        case "ro":     tag = "○ RO"
-        case "locked": tag = manualLocked ? "○ 加密·已手动锁定" : "○ 加密未解锁"
-        default:       tag = "○ 未挂载"
+        if isOther {
+            switch disk.state {
+            case "ro":  tag = "○ 只读已挂载"
+            case "rw":  tag = "● RW"                 // 理论上不会出现（其它分区只读）
+            default:    tag = "○ 只读副本·未挂载"
+            }
+        } else {
+            switch disk.state {
+            case "rw":     tag = "● RW"
+            case "ro":     tag = "○ RO"
+            case "locked": tag = manualLocked ? "○ 加密·已手动锁定" : "○ 加密未解锁"
+            default:       tag = "○ 未挂载"
+            }
         }
-        let item = NSMenuItem(title: "\(disk.label)  [\(tag)]", action: nil, keyEquivalent: "")
+        let title = isOther ? "\(disk.label)  [\(tag)]（\(disk.fs)）" : "\(disk.label)  [\(tag)]"
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         let sub = NSMenu()
 
-        if disk.fs == "bitlocker" && disk.state == "locked" {
+        if isOther {
+            // 其它分区只提供「只读浏览」：说明这是副本，写入不回写原盘
+            let hint = NSMenuItem(title: "只读浏览：导出为免分区表镜像后挂载，写入不回写原盘",
+                                  action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            sub.addItem(hint)
+            sub.addItem(.separator())
+            if disk.state != "ro" && disk.state != "rw" {
+                let mount = NSMenuItem(title: "只读挂载（浏览副本）",
+                                       action: #selector(actionMount(_:)), keyEquivalent: "")
+                mount.target = self
+                mount.representedObject = disk
+                sub.addItem(mount)
+            }
+        } else if disk.fs == "bitlocker" && disk.state == "locked" {
             if manualLocked {
                 let hint = NSMenuItem(title: "已手动锁定：不会自动解锁（解锁后即恢复）",
                                       action: nil, keyEquivalent: "")
