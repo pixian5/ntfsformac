@@ -49,14 +49,31 @@ ntfs_devices() {
       for (i=6; i<=NF-3; i++) label=label " " $i
       print ident, label
     }
-  '
+  ' | while IFS=' ' read -r dev label; do
+      [ -n "$dev" ] || continue
+      # 排除「BitLocker 内层 exFAT/FAT 附加出来的镜像设备」：它由解锁链路自己管理，
+      # 若当成普通 NTFS 盘去挂（ntfs-3g 必然失败）会刷屏，也不会被当成普通盘清理
+      skip=0
+      for rec in "$BL_IMAGE_DIR"/*; do
+        [ -e "$rec" ] || continue
+        [ "$(cat "$rec" 2>/dev/null)" = "$dev" ] && { skip=1; break; }
+      done
+      [ "$skip" = "1" ] && continue
+      printf '%s %s\n' "$dev" "$label"
+    done
 }
 
 # 在 /sbin/mount 输出中查找设备或 FUSE-T 卷的挂载行。
 # 卷标/挂载点可能含空格，不能用 awk 按字段匹配，一律 grep -F 全行匹配。
 mount_line() {
-  local dev="$1" label="$2" line
+  local dev="$1" label="$2" line idev
   line=$(/sbin/mount 2>/dev/null | grep -F "/dev/$dev on " | head -1)
+  # BitLocker 内层为 exFAT/FAT 时，真实挂载是「镜像设备 /dev/diskM on /Volumes/<卷标>」，
+  # 设备名对不上原盘，需按记录的镜像设备再查一次
+  if [ -z "$line" ]; then
+    idev=$(bl_image_dev "$dev")
+    [ -n "$idev" ] && line=$(/sbin/mount 2>/dev/null | grep -F "/dev/$idev on " | head -1)
+  fi
   [ -z "$line" ] && line=$(/sbin/mount 2>/dev/null | grep -F "fuse-t:/$label on " | head -1)
   [ -z "$line" ] && line=$(/sbin/mount 2>/dev/null | grep -F " on /Volumes/$label (" | head -1)
   printf '%s' "$line"
@@ -73,11 +90,21 @@ mount_state() {
   local dev="$1" label="$2" line
   line=$(mount_line "$dev" "$label")
   [ -z "$line" ] && { echo "none"; return; }
-  if printf '%s' "$line" | grep -qE 'read-only|fskit'; then
+  if printf '%s' "$line" | grep -q 'read-only'; then
     echo "ro"
-  else
-    echo "rw"
+    return
   fi
+  # "fskit" 标记：macOS 26 上 FSKit 的 NTFS 实现是只读寄生虫（要清理）；
+  # 而 FSKit 的 exFAT/FAT 实现是原生读写。故仅当挂载行不是「我们附加的镜像设备」时，
+  # 才把 fskit 视为只读，避免把可读写的 exFAT 解密卷误判成 ro
+  if printf '%s' "$line" | grep -q 'fskit'; then
+    local idev; idev=$(bl_image_dev "$dev")
+    if [ -z "$idev" ] || ! printf '%s' "$line" | grep -qF "/dev/$idev on "; then
+      echo "ro"
+      return
+    fi
+  fi
+  echo "rw"
 }
 
 mountpoint_of() {
@@ -144,12 +171,113 @@ bl_container_mp() {
 # 该设备是否已解锁（dislocker-fuse 容器处于挂载状态）
 bl_unlocked() { [ -n "$(bl_container_mp "$1")" ]; }
 
-# 读取解密卷的真实 NTFS 卷标（未解锁读不到，回退 BitLocker-<dev>）
+# ---------- BitLocker 内层文件系统（NTFS / exFAT / FAT） ----------
+# BitLocker 加密的是「卷」本身，内层文件系统既可能是 NTFS，也可能是 exFAT
+# （Windows 10+ 对可移动盘的 BitLocker To Go 常用 exFAT）。两者的挂载方式完全不同：
+#   - NTFS    ：ntfs-3g 直接挂 FUSE-T 里暴露的解密文件 dislocker-file（三层解密链原设计）
+#   - exFAT/FAT：macOS 自带读写驱动可用，但内核驱动只认块设备、不认文件；
+#               需先用 hdiutil 把 dislocker-file 当作「原始磁盘镜像」附加成 /dev/diskM，
+#               再交给 macOS 原生驱动挂载（见 bl_attach_inner）
+BL_IMAGE_DIR=/var/run/ntfsformac/bl-image
+
+# 判定解密卷内层文件系统。读首扇区按签名识别：
+#   NTFS  -> 偏移 3 起 "NTFS    "；exFAT -> 偏移 3 起 "EXFAT   "；FAT32 -> 偏移 0x52 起 "FAT32   "
+# 输出：none(未解锁/读不到) / ntfs / exfat / fat / other
+bl_inner_fs() {
+  local dev="$1" f sig fat
+  f=$(bl_file "$dev")
+  [ -e "$f" ] || { printf 'none'; return; }
+  sig=$(as_root_np dd if="$f" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  case "$sig" in
+    "NTFS    ") printf 'ntfs';  return ;;
+    "EXFAT   ") printf 'exfat'; return ;;
+  esac
+  # FAT32/FAT16：偏移 0x52(82) 起 8 字节
+  fat=$(as_root_np dd if="$f" bs=512 count=1 2>/dev/null | tail -c +83 | head -c 8)
+  case "$fat" in
+    "FAT32   "|"FAT16   ") printf 'fat'; return ;;
+  esac
+  [ -n "$sig" ] && printf 'other' || printf 'none'
+}
+
+# 记录/读取「解密卷附加成镜像设备」得到的 device 标识（如 disk24）
+bl_image_dev() { cat "$BL_IMAGE_DIR/$1" 2>/dev/null; }
+
+# 镜像设备的当前挂载点（未挂载则空）
+bl_outer_mp() {
+  local idev; idev=$(bl_image_dev "$1")
+  [ -n "$idev" ] || return
+  /sbin/mount 2>/dev/null | grep -F "/dev/$idev on " | head -1 | sed 's/^.* on //; s/ (.*$//'
+}
+
+# 把解密卷（内层 exFAT/FAT）附加成块设备并挂载。$1=设备 $2=GUI 属主
+bl_attach_inner() {
+  local dev="$1" owner="$2" f out idev mp i
+  # 先清掉可能残留的旧镜像设备（上次卸载未摘干净），否则重复附加会叠加出两个 /dev/diskM，
+  # 其中一个指向同一解密文件，会造成同一卷被挂两次的隐患
+  bl_detach_inner "$dev"
+  f=$(bl_file "$dev")
+  as_root mkdir -p "$BL_IMAGE_DIR" 2>/dev/null || true
+  # 优先以 GUI 属主身份附加/挂载，挂载归属该用户；失败则回退 root
+  out=$(as_root su -l "$owner" -c "hdiutil attach -nomount -noverify \
+      -imagekey diskimage-class=CRawDiskImage '$f'" 2>&1)
+  idev=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/{print $1}' | tail -1)
+  if [ -z "$idev" ]; then
+    trace "bl: 属主身份附加失败，回退 root 附加"
+    out=$(as_root hdiutil attach -nomount -noverify \
+        -imagekey diskimage-class=CRawDiskImage "$f" 2>&1)
+    idev=$(printf '%s\n' "$out" | awk '/^\/dev\/disk/{print $1}' | tail -1)
+  fi
+  [ -n "$idev" ] || { log "$out"; die "无法把解密卷附加为块设备（hdiutil 附加失败）"; }
+  printf '%s' "${idev#/dev/}" > "$BL_IMAGE_DIR/$dev"
+  trace "bl: 解密卷已附加为 $idev"
+  # 交给 macOS 原生 exFAT/FAT 驱动挂载（默认读写）
+  as_root diskutil mount "$idev" >/dev/null 2>&1 \
+    || as_root su -l "$owner" -c "diskutil mount '$idev'" >/dev/null 2>&1 || true
+  mp=$(bl_outer_mp "$dev")
+  if [ -z "$mp" ]; then
+    as_root rm -f "$BL_IMAGE_DIR/$dev" 2>/dev/null || true
+    die "挂载解密卷（内层 exFAT/FAT）失败"
+  fi
+  # 等挂载点可写就绪（镜像追加有短暂未就绪窗口）
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    as_root su -l "$owner" -c "touch '$mp/.ntfsformac.probe' && rm -f '$mp/.ntfsformac.probe'" 2>/dev/null && break
+    sleep 0.5
+  done
+  as_root mdutil -i off "$mp" >/dev/null 2>&1 || true
+  trace "bl: 解密卷已挂载 $mp"
+}
+
+# 卸载并摘下解密卷的镜像设备（内层 exFAT/FAT 时使用）
+bl_detach_inner() {
+  local dev="$1" idev mp
+  idev=$(bl_image_dev "$dev")
+  [ -n "$idev" ] || return 0
+  mp=$(bl_outer_mp "$dev")
+  as_root sync 2>/dev/null || true
+  if [ -n "$mp" ]; then
+    as_root diskutil unmount force "$mp" >/dev/null 2>&1 \
+      || as_root umount -f "$mp" 2>/dev/null || true
+  fi
+  as_root sync 2>/dev/null || true
+  as_root diskutil eject "/dev/$idev" >/dev/null 2>&1 \
+    || as_root hdiutil detach "/dev/$idev" -force >/dev/null 2>&1 \
+    || log "警告: 镜像设备 /dev/$idev 未能摘下"
+  as_root rm -f "$BL_IMAGE_DIR/$dev" 2>/dev/null || true
+  trace "bl: 已摘下镜像设备 $idev"
+}
+
+# 读取解密卷的真实卷标（未解锁读不到，回退 BitLocker-<dev>）
+# NTFS 内层可读 ntfslabel；exFAT 引导扇区不含卷标，只能从镜像挂载点反推
 bl_label() {
-  local dev="$1" f l
+  local dev="$1" f l mp
   f=$(bl_file "$dev")
   l=""
   [ -e "$f" ] && l=$(as_root_np ntfslabel "$f" 2>/dev/null | head -1)
+  if [ -z "$l" ]; then
+    mp=$(bl_outer_mp "$dev")
+    [ -n "$mp" ] && l="${mp##*/}"
+  fi
   [ -n "$l" ] || l="BitLocker-$dev"
   printf '%s' "$l"
 }
@@ -176,6 +304,9 @@ bl_close_container() {
   local dev="$1" c mp pids pid
   c=$(bl_container "$dev")
   mp=$(bl_container_mp "$dev")
+  # 内层为 exFAT/FAT 时，先摘下镜像设备：镜像还挂着的解密文件必须先释放，
+  # 否则 dislocker-fuse 停掉后 /dev/diskM 会指向已失效的 FUSE 文件
+  bl_detach_inner "$dev"
   # 先全局刷盘：FUSE-T 为写回缓存，确保 ntfs-3g 已写入 dislocker-file 的数据落到后端设备
   as_root sync 2>/dev/null || true
   if [ -n "$mp" ]; then
@@ -183,15 +314,25 @@ bl_close_container() {
     as_root diskutil unmount "$mp" >/dev/null 2>&1 || as_root umount -f "$mp" 2>/dev/null || true
     as_root sync 2>/dev/null || true
   fi
+  # 停 dislocker-fuse：SIGTERM 优雅退出，最多等 3s；仍存活再 SIGKILL 并确认死亡，
+  # 避免残留进程继续占用 /dev/$dev（会导致后续解锁/弹出失败）
   pids=$(pgrep -f "dislocker-fuse .*/dev/$dev" 2>/dev/null)
   for pid in $pids; do
     trace "bl: SIGTERM dislocker-fuse pid=$pid"
     as_root kill -TERM "$pid" 2>/dev/null || true
   done
-  [ -n "$pids" ] && sleep 1
-  for pid in $pids; do
-    kill -0 "$pid" 2>/dev/null && as_root kill -9 "$pid" 2>/dev/null || true
+  local i
+  for i in 1 2 3 4 5 6; do
+    [ -z "$(pgrep -f "dislocker-fuse .*/dev/$dev" 2>/dev/null)" ] && break
+    sleep 0.5
   done
+  for pid in $(pgrep -f "dislocker-fuse .*/dev/$dev" 2>/dev/null); do
+    trace "bl: dislocker-fuse pid=$pid 未退出，SIGKILL"
+    as_root kill -9 "$pid" 2>/dev/null || true
+  done
+  sleep 0.5
+  [ -n "$(pgrep -f "dislocker-fuse .*/dev/$dev" 2>/dev/null)" ] \
+    && log "警告: dislocker-fuse 进程未能结束，可能仍占用 /dev/$dev" || true
   as_root rmdir "$c" 2>/dev/null || true
 }
 
@@ -292,6 +433,24 @@ mount_one() {
     if [ "$(mount_state "$dev" "$label")" != "none" ]; then
       log "已挂载读写: $label → $(mountpoint_of "$dev" "$label")"
       return 0
+    fi
+    # 内层文件系统决定挂载方式：NTFS → ntfs-3g 直接挂解密文件；
+    # exFAT/FAT → macOS 自带驱动，需先把解密文件附加成块设备（内核驱动只认设备）
+    local ifs
+    ifs=$(bl_inner_fs "$dev")
+    trace "bl: $dev 内层文件系统 = $ifs"
+    if [ "$ifs" = "exfat" ] || [ "$ifs" = "fat" ]; then
+      lock_mount || die "另一个挂载操作进行中，请稍后再试"
+      trap 'unlock_mount' EXIT
+      owner=$(resolve_owner); [ -n "$owner" ] || owner=$(id -un)
+      bl_attach_inner "$dev" "$owner"
+      label=$(bl_label "$dev")
+      log "已挂载读写(BitLocker/$ifs): $label → $(mountpoint_of "$dev" "$label")"
+      unlock_mount; trap - EXIT
+      return 0
+    fi
+    if [ "$ifs" != "ntfs" ]; then
+      die "$dev 解密卷内层文件系统为 $ifs，暂不支持挂载（仅支持 NTFS / exFAT / FAT）"
     fi
     lock_mount || die "另一个挂载操作进行中，请稍后再试"
     trap 'unlock_mount' EXIT
@@ -414,6 +573,12 @@ unmount_one() {
   as_root touch "$MARKER_DIR/ejecting.$dev" 2>/dev/null || true
   if ! as_root diskutil unmount "$mp" 2>/dev/null; then
     as_root umount -f "$mp" 2>/dev/null || die "卸载 $mp 失败"
+  fi
+  # BitLocker 内层为 exFAT/FAT 时，挂载实体是「解密文件附加出来的镜像设备」。
+  # 卸载后必须一并摘下该镜像设备，否则会残留一个空挂的 /dev/diskM：
+  # 既在「磁盘工具」里显示幽灵磁盘，也会让下次挂载重复附加出第二个设备。
+  if is_bitlocker "$dev" && [ -n "$(bl_image_dev "$dev")" ]; then
+    bl_detach_inner "$dev"
   fi
   log "已卸载: $mp"
 }

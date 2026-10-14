@@ -201,3 +201,34 @@ Swift 会把 **≤15 字节**的 UTF-8 字面量内联存储，不落在 `__TEXT
   若 `info` 也失败，则是解析/结构问题。
 - 排错工具三件套：`ntfsctl info -v`（datum 列表）、`ntfsctl dump`（导原始元数据副本离线核对）、
   `ntfsctl unlock --verbose`（看它选了哪个 VMK / 用了什么盐值 / 哪种解密方式）。
+
+### 31. BitLocker 卷的内层文件系统可能是 exFAT（不是 NTFS！）
+BitLocker 加密的是「卷」（块设备），内层 FS 可为 NTFS / exFAT / FAT；Windows 10+ 对**可移动盘**
+（BitLocker To Go）默认常用 **exFAT**，真实 U 盘上非常常见。
+- 症状：密码正确、dislocker 解密成功，但 ntfs-3g 挂载失败（它只认 NTFS）。
+- 判定：读解密卷（`/var/run/ntfsformac/bl/<dev>/dislocker-file`）首扇区偏移 3 起 8 字节，
+  `NTFS    `=NTFS；`EXFAT   `=exFAT；偏移 0x52 起 `FAT32   `/`FAT16   `=FAT。
+- 解决：exFAT/FAT 不能交给 ntfs-3g，改用 **macOS 自带读写驱动**，但内核/FSKit 驱动只认块设备，
+  因此需先把解密文件「附加成块设备」：
+  ```bash
+  hdiutil attach -nomount -noverify -imagekey diskimage-class=CRawDiskImage <dislocker-file>
+  diskutil mount /dev/diskM
+  ```
+  **`-imagekey diskimage-class=CRawDiskImage` 必须带**（按原始裸磁盘镜像处理，否则可能被当作
+  UDIF/稀疏映像导致偏移或只读）。以 GUI 属主身份附加+挂载，`/Volumes/X` 属主才是登录用户。
+- 收尾：卸载/弹出前必须先 `diskutil eject /dev/diskM` 摘掉镜像设备，否则会残留幽灵磁盘、
+  下次重复附加出第二个 `/dev/diskM`（同一卷被挂两次的隐患）。
+- 详见 docs/20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md。
+
+### 32. macOS 26 的 `fskit` 挂载标记 ≠ 只读（仅 NTFS 才是只读）
+`/sbin/mount` 输出里带 `fskit` 表示该 FS 由 macOS 的 FSKit 用户态框架实现。
+- FSKit 的 **NTFS** 实现是只读寄生虫（本项目要识别并清理）。
+- FSKit 的 **exFAT/FAT** 实现是**原生读写**（实测 `/dev/disk24 on /Volumes/X (exfat, ..., fskit, ...)`
+  可正常写入）。
+- 教训：不能把「挂载行含 fskit」一律当作只读，否则会把刚挂上的可写 exFAT 解密卷误报成 `ro`，
+  引发守护进程/App 反复"修复挂载"。判定只读时应排除「我们附加的镜像设备」这种情况。
+
+### 33. 同一 NTFS 卷被挂两次的另一条路径：重复 attach 镜像
+`unmount` 若只卸载文件系统而不摘下 `hdiutil attach` 出来的镜像设备，再次 `mount` 会**又 attach 一次**，
+得到第二个 `/dev/diskM`。虽然两者都指向同一 `dislocker-file`（不比两块独立挂载危险），但仍属叠加挂载。
+- 修复：`unmount_one` 在卸载后立刻 `bl_detach_inner`；`bl_attach_inner` 进入前也先清理残留镜像记录。

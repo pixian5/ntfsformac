@@ -28,8 +28,10 @@ macOS 13 起移除了系统内置 NTFS 写入支持；macOS 26 上苹果的 FSKi
 │ /usr/local/bin/ntfs-3g（macos-fuse-t 分支） │
 │  ← 链接 libfuse-t（FUSE-T 运行时）          │
 └───────────────┬────────────────────────────┘
-   BitLocker 加密卷时 ntfs-3g 挂的是解密后的虚拟卷：
-   /dev/diskN ──dislocker-fuse──▶ <容器>/dislocker-file ──ntfs-3g──▶ /Volumes/<卷标>
+   BitLocker 加密卷时挂的是解密后的虚拟卷，按内层文件系统分流：
+   ├ 内层 NTFS      /dev/diskN ─dislocker-fuse─▶ <容器>/dislocker-file ─ntfs-3g─▶ /Volumes/<卷标>
+   └ 内层 exFAT/FAT /dev/diskN ─dislocker-fuse─▶ dislocker-file ─hdiutil 附加─▶ /dev/diskM
+                                                                     ─macOS 原生驱动─▶ /Volumes/<卷标>
 ┌────────────────────────────────────────────┐
 │ /usr/local/bin/dislocker-fuse（v0.7.3）     │
 │  解锁 BitLocker：用户密码/恢复密码/BEK       │
@@ -86,18 +88,22 @@ ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.10）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁。
+菜单栏 App（v0.0.11）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁。
 
 v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
 导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
 并新增诊断三件套 `ntfsctl info -v` / `ntfsctl dump` / `unlock --verbose`。
-BitLocker 加密镜像盘端到端 29 项全绿；真实 U 盘已能完整解析元数据、错误已收敛到「凭据层」。
+
+v0.0.11 支持 **BitLocker 内层是 exFAT/FAT** 的情形（BitLocker To Go 可移动盘很常见）：
+macOS 自带读写驱动只认块设备，故把解密文件用 `hdiutil` 附加成块设备后再交原生驱动挂载。
+**真实 U 盘（Ventoy15.1, exFAT）已端到端跑通**：解锁 → 挂载读写 → 8MB 写入并 SHA-256 校验一致 →
+卸载/重挂（不重复附加）→ 重新锁定无残留 → 再解锁数据仍在 → 安全弹出。
 
 详情见 [docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md)。
 
 ## 下一步待实现
 
-优先级最高的三件事：物理 BitLocker 盘成功解锁压测（缺真实凭据）、卸载脚本、pkg 安装器；另有开机自启、事件通知等规划。
+优先级最高的三件事：物理 BitLocker 盘端到端压测（**已在真实 U 盘 exFAT 卷完成**，NTFS 内层待验）、卸载脚本、pkg 安装器；另有开机自启、事件通知等规划。
 
 详情见 [docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md)。
 
@@ -117,8 +123,9 @@ BitLocker 加密镜像盘端到端 29 项全绿；真实 U 盘已能完整解析
 | [known-issues.md](docs/known-issues.md) | 开发踩坑经验（FSKit 抢占、卷标解析、Parallels 锁文件、FUSE-T 就绪窗口等） |
 | [driver-install.md](docs/driver-install.md) | 驱动安装 / 重装 / 卸载手册 |
 | [20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md](docs/20261014-2116-BitLocker支持-DeepSeek-V4.1-Flash.md) | BitLocker 解锁/读写方案与验证全过程 |
+| [20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md](docs/20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md) | 真实 U 盘解锁失败根因：未知 datum 中断遍历（含诊断三件套） |
+| [20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md](docs/20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md) | BitLocker 内层 exFAT：hdiutil 原始镜像附加 + macOS 原生驱动挂载（真实 U 盘端到端） |
 | [20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md](docs/20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md) | 恢复密码 / .BEK 文件解锁入口（含 dislocker 55 字符铁律） |
-| [20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md](docs/20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md) | 真实 U 盘解锁失败根因：未知 datum 中断遍历（含诊断三件套与盘结构差异对照） |
 | [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
 | [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划（P0/P1/P2 分级） |
 
