@@ -63,7 +63,9 @@ bash build-app.sh
 - **BitLocker 加密盘**：自动挂载只标记 🔒「加密未解锁」并跳过（**绝不猜密码**）。菜单栏点开有**三种解锁入口**：
   「用密码解锁…」「用恢复密码解锁…」（48 位数字，连字符可省略）「用 .BEK 文件解锁…」（Windows 导出的恢复密钥文件）。
   勾选「记住」会把凭据存入钥匙串（**按 BitLocker 卷 GUID 做键**，跨插拔稳定），下次插入自动解锁。
-  也有「重新锁定」「忘记已保存的密码」。App 运行日志见 `~/Library/Logs/NTFSFormac/app.log`。
+  也有「锁定 BitLocker（锁定后不再自动解锁）」「忘记已保存的密码」。App 运行日志见 `~/Library/Logs/NTFSFormac/app.log`。
+- 报错/提示窗口**不置顶、不抢焦点**，正文可拖选 + ⌘C，另有「复制全部」按钮（整段报错一键入剪贴板）。
+
 - 命令行（可选）：
 
 ```bash
@@ -74,7 +76,8 @@ ntfsctl unlock disk4s1 --password-file /path/pw   # 用用户密码解锁 BitLoc
 ntfsctl unlock disk4s1 --recovery 123456-123456-123456-123456-123456-123456-123456-123456
 ntfsctl unlock disk4s1 --bek /path/XXXXXXXX.BEK   # 用 BEK 恢复密钥文件解锁
 ntfsctl unlock disk4s1 --password 密码 --verbose  # 解锁失败时输出 dislocker 调试日志
-ntfsctl lock disk4s1       # 重新锁定 BitLocker（卸载 + 停止解密）
+ntfsctl lock disk4s1       # 锁定 BitLocker（卸载 + 停止解密，且不会再被 App 自动解锁）
+                           #   （标记 /var/run/ntfsformac/locked.<dev>；unlock/eject/拔盘后自动清除）
 ntfsctl info -v disk4s1    # 读 BitLocker 元数据（无需凭据，诊断用）
 ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线排错用）
 ```
@@ -89,7 +92,7 @@ ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.13）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 重新锁定 + 钥匙串自动解锁。
+菜单栏 App（v0.0.14）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
 
 v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
 导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
@@ -104,6 +107,16 @@ v0.0.12 修复**「记住密码」完全失效**（三个叠加根因：`securit
 钥匙串用会变的设备名做键、`autoTried` 标记时机错误），改用**卷 GUID**做键；
 并新增加密盘/杂项分区的**挂载前 NTFS 签名预检**，消除守护日志被非 NTFS 分区 `ntfs-3g` 失败刷屏。
 v0.0.13 补上验证中发现的 `lock` 未持互斥锁缺口（避免「解锁报成功、随即回退 locked」的假成功）。
+
+v0.0.14 解决用户反馈的三件事：
+① 报错弹窗从 `NSAlert + runModal()` 改为自定义 `NSPanel` —— **不置顶、不抢焦点、不阻塞 App**，
+   正文改用可拖选的 `NSTextView` 并新增「复制全部」按钮；
+② `eject_one` 纳入 `lock_mount` 互斥锁（`mount/unmount/lock/unlock/eject` 五者彻底串行化）；
+③ 新增**手动锁定标记** `locked.<dev>`，命令行 `ntfsctl lock` 不再被 App 在 3 秒内自动解开
+   （标记在 unlock/eject/拔盘后自动清除，含「标记先落再卸载」的竞态修正）。
+另**顺带修复守护进程 porcelain 解析**：v0.0.12 给 porcelain 加第 6 字段 `guid` 后，守护脚本仍按 5 字段 `read`，
+导致 **BitLocker 行**（guid 非空）的 `state` 被污染成 `rw|<guid>`、分支失配（已改为 6 字段 + `_rest` 兜底）；
+NTFS 行因 bash 会剥掉行尾空字段而不受影响（详见 known-issues #40/#44 —— 初版结论曾因用 zsh 复现而出错）。
 
 详情见 [docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md)。
 
@@ -132,6 +145,7 @@ v0.0.13 补上验证中发现的 `lock` 未持互斥锁缺口（避免「解锁�
 | [20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md](docs/20261014-2235-未知datum解析修复-DeepSeek-V4.1-Flash.md) | 真实 U 盘解锁失败根因：未知 datum 中断遍历（含诊断三件套） |
 | [20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md](docs/20261014-2310-BitLocker内层exFAT挂载-DeepSeek-V4.1-Flash.md) | BitLocker 内层 exFAT：hdiutil 原始镜像附加 + macOS 原生驱动挂载（真实 U 盘端到端） |
 | [20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md](docs/20261014-2351-记住密码修复与挂载签名预检-DeepSeek-V4.1-Flash.md) | 「记住密码」失效三根因（security hex 化 / 设备名做键 / autoTried 时机）+ 卷 GUID 键 + 挂载前签名预检 + lock 互斥锁缺口 |
+| [20261015-0045-报错弹窗重构与手动锁定标记-DeepSeek-V4.1-Flash.md](docs/20261015-0045-报错弹窗重构与手动锁定标记-DeepSeek-V4.1-Flash.md) | 报错弹窗改可复制非阻塞 NSPanel + eject 互斥锁 + 手动锁定标记（含竞态修正）+ porcelain 6 字段回归 |
 | [20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md](docs/20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md) | 恢复密码 / .BEK 文件解锁入口（含 dislocker 55 字符铁律） |
 | [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
 | [20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261014-2116-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划（P0/P1/P2 分级） |

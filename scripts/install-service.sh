@@ -78,6 +78,7 @@ SUDOERS_TMP=$(mktemp /tmp/ntfsformac.sudoers.XXXXXX)
   printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/test/test-boundary.sh*\n' "$OWNER_USER" "$SRC_DIR"
   printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/test/test-automount.sh*\n' "$OWNER_USER" "$SRC_DIR"
   printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/test/test-bitlocker.sh*\n' "$OWNER_USER" "$SRC_DIR"
+  printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/test/test-manual-lock.sh*\n' "$OWNER_USER" "$SRC_DIR"
 } > "$SUDOERS_TMP"
 install -m 440 -o root -g wheel "$SUDOERS_TMP" "$SUDOERS_FILE"
 rm -f "$SUDOERS_TMP"

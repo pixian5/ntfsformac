@@ -36,7 +36,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     private var prevStates: [String: String] = [:]   // device -> state 上次快照（用于事件通知）
     private var autoTried: Set<String> = []          // 本会话已尝试过自动解锁的键（避免反复试探）
     private var noCredChecked: Set<String> = []      // 本会话已确认「无保存凭据」的键（避免每 3 秒重复查钥匙串）
+    private var manualLockNoticed: Set<String> = []  // 已记录过「手动锁定」日志的键（避免每 3 秒刷屏）
     private let keychainService = "NTFSFormac"       // 钥匙串条目 service 名（BitLocker 密码记忆）
+
+    /// ntfsctl 的运行时目录（root 属主但权限 0755，App 以普通用户身份可读，无需提权）
+    private static let runDir = "/var/run/ntfsformac"
+
+    /// 该盘是否被用户「手动锁定」：ntfsctl lock 会落下 <runDir>/locked.<dev> 标记。
+    /// 标记由 ntfsctl unlock / eject 清除，设备节点消失（拔盘）时由 ntfsctl list 自动清理，
+    /// 所以重新插拔后（哪怕盘号没变）自动解锁会恢复正常。
+    private func isManuallyLocked(_ disk: Disk) -> Bool {
+        FileManager.default.fileExists(atPath: "\(Self.runDir)/locked.\(disk.device)")
+    }
 
     // MARK: - 运行日志（开发测试版：详细记录自动解锁等关键决策，便于排错）
     // 写入 ~/Library/Logs/NTFSFormac/app.log（用户目录可写，符合 macOS 日志惯例；
@@ -114,8 +125,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let liveKeys = Set(disks.map { keychainAccount(for: $0) })
         autoTried = autoTried.intersection(liveKeys)
         noCredChecked = noCredChecked.intersection(liveKeys)
+        manualLockNoticed = manualLockNoticed.intersection(liveKeys)
         for d in disks where d.fs == "bitlocker" && d.state == "locked" {
             let key = keychainAccount(for: d)
+            // 用户手动锁定过（命令行 ntfsctl lock / 菜单「重新锁定 BitLocker」）→ 尊重意图，不自动解锁。
+            // 否则命令行的 lock 会在 3 秒内被 App 重新解开，等于锁不住。
+            if isManuallyLocked(d) {
+                if manualLockNoticed.insert(key).inserted {
+                    appLog("\(d.device) 存在手动锁定标记，跳过自动解锁（ntfsctl unlock 或菜单解锁后恢复）")
+                }
+                continue
+            }
+            manualLockNoticed.remove(key)
             if autoTried.contains(key) || noCredChecked.contains(key) { continue }
             // 必须先确认「有保存的凭据」才记入 autoTried。
             // 旧版在这里就先写入 autoTried，于是「第一次插入时还没记住密码」的盘会被永久标记为
@@ -277,17 +298,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func makeDiskItem(_ disk: Disk) -> NSMenuItem {
+        // 手动锁定（命令行 ntfsctl lock 或菜单锁定）会让 App 停止自动解锁，菜单里明示出来
+        let manualLocked = disk.state == "locked" && isManuallyLocked(disk)
         let tag: String
         switch disk.state {
         case "rw":     tag = "● RW"
         case "ro":     tag = "○ RO"
-        case "locked": tag = "○ 加密未解锁"
+        case "locked": tag = manualLocked ? "○ 加密·已手动锁定" : "○ 加密未解锁"
         default:       tag = "○ 未挂载"
         }
         let item = NSMenuItem(title: "\(disk.label)  [\(tag)]", action: nil, keyEquivalent: "")
         let sub = NSMenu()
 
         if disk.fs == "bitlocker" && disk.state == "locked" {
+            if manualLocked {
+                let hint = NSMenuItem(title: "已手动锁定：不会自动解锁（解锁后即恢复）",
+                                      action: nil, keyEquivalent: "")
+                hint.isEnabled = false
+                sub.addItem(hint)
+                sub.addItem(.separator())
+            }
             // 加密卷未解锁：提供三种凭据入口（用户密码 / 48 位恢复密码 / .BEK 恢复密钥文件）。
             // 绝不猜密码，凭据一律由用户主动输入或选择文件。
             let entries: [(String, Selector)] = [
@@ -316,7 +346,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         if disk.fs == "bitlocker" && disk.state != "locked" {
-            let lock = NSMenuItem(title: "重新锁定 BitLocker", action: #selector(actionLockBL(_:)), keyEquivalent: "")
+            let lock = NSMenuItem(title: "锁定 BitLocker（锁定后不再自动解锁）",
+                                  action: #selector(actionLockBL(_:)), keyEquivalent: "")
             lock.target = self
             lock.representedObject = disk
             sub.addItem(lock)
@@ -646,12 +677,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         return true
     }
 
+    /// 错误/提示窗口（非阻塞、不置顶、文字可选中复制）。
+    ///
+    /// 为什么不再用 NSAlert + runModal()：
+    ///   1. runModal() 会独占事件循环 —— 弹窗期间菜单栏 App 完全卡死，定时器停摆，
+    ///      用户必须点掉才能继续用电脑；
+    ///   2. NSAlert 的 informativeText 是普通标签，文字**不能选中**，长报错无法复制去搜索；
+    ///   3. NSAlert 默认浮在最前并抢占焦点，会挡住正在操作的窗口。
+    /// 新实现：NSPanel(.nonactivatingPanel) + 普通窗口层级（level = .normal，不置顶）
+    ///         + 可选中 NSTextView + 「复制全部」按钮 + orderFrontRegardless()（显示但不激活 App）。
+    private var errorPanels: [String: ErrorPanel] = [:]   // key -> 面板（保活 + 同内容去重）
+
     private func alert(_ title: String, _ text: String) {
-        let a = NSAlert()
-        a.messageText = title
-        a.informativeText = text
-        a.alertStyle = .warning
-        a.runModal()
+        let key = title + "\u{1}" + text
+        // 同一条错误已经开着就不再叠一层（自动解锁失败等场景可能反复触发）
+        if errorPanels[key] != nil { return }
+        appLog("提示窗口: \(title) | \(text.replacingOccurrences(of: "\n", with: " ⏎ "))")
+        let p = ErrorPanel(title: title, text: text)
+        errorPanels[key] = p
+        p.onClose = { [weak self] in self?.errorPanels.removeValue(forKey: key) }
+        p.show()
     }
 
     // MARK: - 驱动版本检查（本地 + 远端 GitHub release）
@@ -725,5 +770,144 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let e = err.fileHandleForReading.readDataToEndOfFile()
         return (p.terminationStatus,
                 (String(data: d, encoding: .utf8) ?? "") + (String(data: e, encoding: .utf8) ?? ""))
+    }
+}
+
+// MARK: - 可复制的非阻塞提示面板
+
+/// 报错/提示面板：文字可选中、带「复制全部」按钮、不置顶、不抢焦点、不阻塞 App。
+/// 由 AppDelegate.alert(_:_:) 创建并持有（保活），窗口关闭时通过 onClose 回调释放引用。
+final class ErrorPanel: NSObject, NSWindowDelegate {
+
+    /// 窗口关闭时的回调（AppDelegate 用它把自己持有的引用清掉，避免面板泄漏）
+    var onClose: (() -> Void)?
+
+    private let panel: NSPanel
+    private let body: String
+    /// 已弹出过的面板数量（用于错位摆放，避免多个报错窗口完全重叠看不清）
+    private static var shown = 0
+
+    init(title: String, text: String) {
+        self.body = text
+
+        // .nonactivatingPanel：点击面板不会把 App 变成前台活跃应用（不打断用户当前操作）
+        // .utilityWindow：小标题栏，视觉上不与正经文档窗口抢注意力
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 560, height: 340),
+                        styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel],
+                        backing: .buffered,
+                        defer: false)
+        p.title = title
+        p.level = .normal                 // 关键：普通层级 = 不置顶，不会一直压在其它 App 上面
+        p.isFloatingPanel = false         // 不随 App 失活而浮到最前
+        p.becomesKeyOnlyIfNeeded = true   // 只有用户真要输入/选择时才成为 key window
+        p.hidesOnDeactivate = false       // App 失活时不要自动隐藏（否则用户找不到报错）
+        p.isReleasedWhenClosed = false    // 交给 ARC 管理，避免关闭后野指针崩溃
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        p.minSize = NSSize(width: 420, height: 200)
+        self.panel = p
+        super.init()
+        p.delegate = self
+
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 340))
+        p.contentView = content
+
+        // 标题（加粗）
+        let titleLbl = NSTextField(labelWithString: title)
+        titleLbl.font = NSFont.boldSystemFont(ofSize: 13)
+        titleLbl.lineBreakMode = .byTruncatingTail
+        titleLbl.maximumNumberOfLines = 1
+
+        // 正文：可选中 + 可滚动的只读文本视图（NSAlert 的 informativeText 做不到选中）
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        scroll.drawsBackground = true
+        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: 520, height: 220))
+        tv.isEditable = false
+        tv.isSelectable = true            // 关键：允许选中 → ⌘C 可复制
+        tv.isRichText = false
+        tv.allowsUndo = false
+        tv.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)  // 等宽，路径/设备名好核对
+        tv.textContainerInset = NSSize(width: 6, height: 6)
+        tv.autoresizingMask = [.width]
+        tv.string = text
+        scroll.documentView = tv
+
+        // 提示 + 按钮
+        let hint = NSTextField(labelWithString: "可直接选中文字后按 ⌘C 复制")
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+
+        let copyBtn = NSButton(title: "复制全部", target: self, action: #selector(copyAll(_:)))
+        copyBtn.bezelStyle = .rounded
+        let closeBtn = NSButton(title: "关闭", target: self, action: #selector(closePanel(_:)))
+        closeBtn.bezelStyle = .rounded
+        closeBtn.keyEquivalent = "\u{1b}"   // Esc 关闭
+
+        for v in [titleLbl, scroll, hint, copyBtn, closeBtn] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            titleLbl.topAnchor.constraint(equalTo: content.topAnchor, constant: 14),
+            titleLbl.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            titleLbl.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+
+            scroll.topAnchor.constraint(equalTo: titleLbl.bottomAnchor, constant: 10),
+            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+
+            hint.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
+            hint.centerYAnchor.constraint(equalTo: copyBtn.centerYAnchor),
+
+            copyBtn.topAnchor.constraint(equalTo: scroll.bottomAnchor, constant: 12),
+            copyBtn.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            copyBtn.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+
+            closeBtn.centerYAnchor.constraint(equalTo: copyBtn.centerYAnchor),
+            closeBtn.trailingAnchor.constraint(equalTo: copyBtn.leadingAnchor, constant: -10),
+        ])
+
+        // 点窗口时第一个响应者是文本视图，方便直接拖选
+        p.initialFirstResponder = tv
+    }
+
+    /// 显示面板：orderFrontRegardless() 只把窗口提到前面，**不激活 App、不抢键盘焦点**。
+    func show() {
+        panel.center()
+        // 多个报错窗口依次错位，避免完全重叠看不出有几个
+        let n = ErrorPanel.shown % 6
+        ErrorPanel.shown += 1
+        if n > 0 {
+            var f = panel.frame
+            f.origin.x += CGFloat(n) * 26
+            f.origin.y -= CGFloat(n) * 26
+            panel.setFrame(f, display: true)
+        }
+        panel.orderFrontRegardless()
+    }
+
+    /// 「复制全部」：整段报错写入剪贴板（选中局部时请用 ⌘C）
+    @objc private func copyAll(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(body, forType: .string)
+        // 按钮短暂变成「已复制」给出反馈（面板不是 key window，不能用声音/焦点提示）
+        guard let btn = sender as? NSButton else { return }
+        let old = btn.title
+        btn.title = "已复制 ✓"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak btn] in
+            btn?.title = old
+        }
+    }
+
+    @objc private func closePanel(_ sender: Any?) {
+        panel.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose?()
     }
 }

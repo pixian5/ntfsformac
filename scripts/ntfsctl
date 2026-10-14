@@ -377,6 +377,7 @@ bl_unlock_one() {
 
   if bl_unlocked "$dev"; then
     log "$dev 已解锁"
+    locked_mark_clear "$dev"      # 用户主动解锁 = 撤销「保持锁定」意图，恢复 App 自动解锁
     mount_one "$dev"
     return 0
   fi
@@ -410,6 +411,7 @@ bl_unlock_one() {
   fi
 
   unlock_mount; trap - EXIT
+  locked_mark_clear "$dev"        # 用户主动解锁 = 撤销「保持锁定」意图，恢复 App 自动解锁
   log "已解锁: /dev/$dev → $(bl_container "$dev")"
   mount_one "$dev"
 }
@@ -423,12 +425,21 @@ bl_lock_one() {
   # 已锁定」的假成功。实测曾因此复现（手动 lock 与 App 自动解锁同时发起）。
   lock_mount || die "另一个挂载/解锁操作进行中，请稍后再试"
   trap 'unlock_mount' EXIT
+  # 「手动锁定」标记必须**先落**，再卸载/停容器。
+  # 菜单栏 App 每 3 秒轮询一次；若等卷已经变 locked 才创建标记，就存在竞态窗口 ——
+  # App 恰好在该窗口内读到 locked 却看不到标记，于是自动解锁，命令行的 lock 等于白做
+  # （实测第一次验证就撞上这个窗口）。标记先落好则两种情况都拦得住：
+  #   refresh 早于本命令 → 看到的是 rw，根本不进自动解锁分支；
+  #   refresh 晚于本命令 → 看到标记，直接跳过。
+  # 清除时机：ntfsctl unlock / eject；设备节点消失（拔盘）时由 list 自动清理。
+  as_root mkdir -p "$MARKER_DIR" 2>/dev/null || true
+  as_root touch "$MARKER_DIR/locked.$dev" 2>/dev/null || true
   label=$(bl_label "$dev")
   mp=$(mountpoint_of "$dev" "$label")
   [ -n "$mp" ] && unmount_one "$dev"
   bl_close_container "$dev"
   unlock_mount; trap - EXIT
-  log "已锁定: /dev/$dev"
+  log "已锁定: /dev/${dev}（不会被自动解锁；用 ntfsctl unlock ${dev} 恢复）"
 }
 
 # ---------- 挂载互斥锁（mkdir 原子锁，防守护进程与手动操作并发叠加挂载） ----------
@@ -453,6 +464,42 @@ lock_mount() {
 
 unlock_mount() {
   as_root rmdir "$MOUNT_LOCK" 2>/dev/null || true
+}
+
+# ---------- 「手动锁定」标记（阻止菜单栏 App 把刚锁上的卷又自动解开） ----------
+# 菜单栏 App 每 3 秒轮询一次，看到 locked 的 BitLocker 卷且钥匙串里有凭据就自动解锁；
+# 于是命令行 `ntfsctl lock` 会在几秒内被悄悄撤销。约定：存在 <MARKER_DIR>/locked.<dev>
+# 时 App 跳过自动解锁（该目录 0755，App 以普通用户身份即可读到，无需提权）。
+LOCKED_TTL=86400   # 兜底有效期（秒）。主清理靠「设备节点消失」，TTL 只防长期无人轮询
+
+# 清除某设备的手动锁定标记（unlock / eject 时调用，表示用户已不再要求保持锁定）
+locked_mark_clear() {
+  as_root rm -f "$MARKER_DIR/locked.$1" 2>/dev/null || true
+}
+
+# 清理失效的手动锁定标记：设备节点已消失（拔盘/弹出）或超过 TTL。
+# 挂在 list 分支里执行（App 每 3 秒以 root 调 list），所以守护进程没跑也能及时清理；
+# 关键是解决「拔盘再插回、盘号没变」时旧标记把自动解锁永久挡住的问题。
+prune_locked_markers() {
+  local m dev now mt
+  [ "$(id -u)" = "0" ] || return 0        # 非 root 删不掉，交给下一次 root 调用
+  [ -d "$MARKER_DIR" ] || return 0
+  now=$(date +%s)
+  for m in "$MARKER_DIR"/locked.*; do
+    [ -e "$m" ] || continue               # 无匹配时 glob 原样返回，这里挡掉
+    dev="${m##*/locked.}"
+    if [ ! -e "/dev/$dev" ]; then
+      rm -f "$m" 2>/dev/null || true
+      # 走 stderr：list --porcelain 的 stdout 必须只有数据行，混进日志会打乱解析
+      printf '[ntfsctl] 清理失效的手动锁定标记: %s（设备已不存在）\n' "$dev" >&2
+    else
+      mt=$(stat -f '%m' "$m" 2>/dev/null || echo 0)
+      if [ $(( now - mt )) -gt "$LOCKED_TTL" ]; then
+        rm -f "$m" 2>/dev/null || true
+        printf '[ntfsctl] 清理过期的手动锁定标记: %s（超过 %ss）\n' "$dev" "$LOCKED_TTL" >&2
+      fi
+    fi
+  done
 }
 
 # ---------- 挂载 ----------
@@ -649,9 +696,16 @@ eject_one() {
   [ -z "$parent" ] && parent="$dev"
   trace "eject_one dev=$dev label=$label parent=$parent"
 
+  # 必须与 mount/unlock/lock 共享同一把互斥锁：弹出会解挂 FUSE、杀 ntfs-3g、拆 dislocker 容器、
+  # 再 diskutil eject 父盘；若此时守护进程/App 正在给同一设备挂载或解锁，两边会互相踩
+  # （典型后果：刚 eject 完的盘又被挂回来、或 dislocker 容器半拆状态导致下次解锁失败）。
+  lock_mount || die "另一个挂载/卸载操作进行中，请稍后再试"
+  trap 'unlock_mount' EXIT
+
   # 1. eject marker（防 daemon 立即重挂）
   as_root mkdir -p "$MARKER_DIR" 2>/dev/null || true
   as_root touch "$MARKER_DIR/ejecting.$dev" 2>/dev/null || true
+  locked_mark_clear "$dev"          # 盘要走了，顺手清掉手动锁定标记，避免残留
 
   # 2. 按 label 精确解挂 FUSE-T 挂载（避免误伤其它盘；label 可能含空格，用 grep -F 全行匹配）
   /sbin/mount 2>/dev/null | grep -F "fuse-t:/$label on " | while IFS= read -r line; do
@@ -694,6 +748,7 @@ eject_one() {
     as_root diskutil eject "$parent" 2>/dev/null || log "警告: diskutil eject $parent 失败，请手动弹出"
   fi
   as_root rm -f "$MARKER_DIR/ejecting.$dev" 2>/dev/null || true
+  unlock_mount; trap - EXIT
   log "已弹出: $dev ($label)"
 }
 
@@ -716,6 +771,9 @@ case "$CMD" in
   list)
     PORCELAIN=""
     for a in "$@"; do [ "$a" = "--porcelain" ] && PORCELAIN=1; done
+    # 顺手清理失效的「手动锁定」标记（设备已拔走 / 超期）。
+    # list 由菜单栏 App 每 3 秒以 root 调用一次，是现成的心跳点，不必再依赖守护进程是否存活。
+    prune_locked_markers
     # 输出: device|label|<fs:ntfs|bitlocker>|mountpoint|<state:rw|ro|none|locked>|guid
     # guid 仅 BitLocker 卷有（用于 App 侧做「跨插拔稳定的钥匙串键」）；非 BitLocker 为空
     ntfs_devices | while IFS=' ' read -r dev label; do
@@ -876,8 +934,11 @@ case "$CMD" in
   ntfsctl mount   <disk|label|all>           挂载为读写
   ntfsctl unmount <disk|label|all>           卸载（不弹出）
   ntfsctl eject   <disk|label|all>           安全弹出
-  ntfsctl lock    <disk|label|all>           重新锁定 BitLocker 卷并卸载
-  ntfsctl unlock  <disk|label|all> <凭据>    解锁 BitLocker 并挂载读写
+  ntfsctl lock    <disk|label|all>           锁定 BitLocker 卷并卸载
+                                             同时落下 /var/run/ntfsformac/locked.<dev> 标记，
+                                             菜单栏 App 见到该标记就不再自动解锁（否则 3 秒内会被解开）；
+                                             标记在 unlock / eject 或拔盘后自动清除
+  ntfsctl unlock  <disk|label|all> <凭据>    解锁 BitLocker 并挂载读写（同时清除手动锁定标记）
      凭据: --password-file <路径> | --password <密码>
            --recovery-file <路径> | --recovery <48位恢复密码>
            --bek <BEK文件> | --clearkey

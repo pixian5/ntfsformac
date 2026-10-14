@@ -293,5 +293,68 @@ macOS 的 `security add-generic-password -w <值>` 在值含有**可打印 ASCII
 - 复现方式：同时（或紧接）发起 `ntfsctl lock` 与 App 自动解锁。实测因此误判过一次「自动解锁不生效」，
   实为测试步骤自身造成的竞态。
 - 修复：`bl_lock_one` 全程持有 `lock_mount`（`trap 'unlock_mount' EXIT` 兜底）。
-- 启发：凡是会**改动同一设备挂载态**的子命令（lock / eject / mount / unmount）都应共享这把锁；
-  `eject_one` 目前仍未持锁，属已知遗留（见「下一步待实现」）。
+- 启发：凡是会**改动同一设备挂载态**的子命令（lock / eject / mount / unmount）都应共享这把锁。
+  v0.0.14 已把 `eject_one` 也纳入（见 #41 附近的验证清单），至此四者全部串行化。
+
+### 40. `read` 的最后一个变量会吞掉「本行剩余」——但影响面取决于「行尾字段是否为空」
+`ntfs-automount.sh` 的扫描循环原本是 `IFS='|' read -r dev label fs mp state`（5 个变量）。
+v0.0.12 给 `ntfsctl list --porcelain` 加了第 6 个字段 `guid` 后，`read` 的最后一个变量会吃下「本行剩余」，
+于是 `state` 被污染成 `rw|<guid>`。
+- **修正后的真实影响面**（初版本文档把它写成「自动挂载彻底静默失效」，是经 zsh 复现得出的**错误结论**）：
+  - 第 6 字段**非空**（BitLocker 卷，guid 非空）→ `state="rw|4967D63B-…"` → `case` 失配 →
+    `rw` 分支的只读寄生虫清理不执行、`ro`/`none` 时不自动挂载。
+  - 第 6 字段**为空**（NTFS 卷）→ **bash 会把尾部空字段连同分隔符一起剥掉**，`state` 仍是干净的 `ro`/`none`，
+    **NTFS 自动挂载一直正常**。
+- 复现（**必须在 bash 下**，见 #44）：
+  ```
+  printf 'a|b|c|d|ro|\n'  | /bin/bash -c 'while IFS="|" read -r v1 v2 v3 v4 state; do echo "[$state]"; done'  # [ro]
+  printf 'a|b|c|d|rw|GUID\n' | /bin/bash -c 'while IFS="|" read -r v1 v2 v3 v4 state; do echo "[$state]"; done'  # [rw|GUID]
+  ```
+- 修复：`read -r dev label fs mp state guid _rest`（多读一个 `_rest` 兜底，以后再加字段也不重演）。
+- 教训：**行式协议的字段数一旦变化，必须检查所有消费方**；「多出的字段用兜底变量接住」应成为书写习惯。
+  这类回归不报错、不写日志，只表现为功能莫名不工作。
+
+### 41. 手动锁定标记必须**先落**，再卸载/停容器（否则存在竞态窗口）
+菜单栏 App 每 3 秒轮询，看到 `locked` 且钥匙串有凭据就自动解锁 —— 会让命令行 `ntfsctl lock` 白做。
+第一版把 `touch /var/run/ntfsformac/locked.<dev>` 放在 `bl_close_container` **之后**，验证时撞上竞态：
+- 时序：`lock` 执行中卷已 unmount、marker 还未创建 → App 恰好在此窗口读到 `locked` 且看不到 marker
+  → 自动解锁 → 调 `ntfsctl unlock` → 反而把 marker 清掉。
+- 证据：App 日志 `00:38:35 尝试自动解锁` / `00:38:43 成功`，而 `ls` 显示 marker 时间同为 `00:38`
+  （命令返回时 marker 已在，但 App 早在那之前 refresh 过）。
+- 修复：marker 创建提到 `lock_mount` **之后、任何卸载动作之前**。此时两种情况都拦得住：
+  refresh 早于本命令看到的是 `rw`（不进解锁分支）；晚于本命令则看到 marker。
+- 修正后验证：连测 12 秒，卷保持 `locked`，App 日志**零新增**（连 `readCredential` 都没调用）。
+
+### 42. 自定义报错面板要用 `.nonactivatingPanel` + `level = .normal`，且不能 `runModal()`
+`NSAlert + runModal()` 作为菜单栏常驻 App 的报错手段有三个问题：`informativeText` 是 label **不能选中**；
+`runModal()` **独占事件循环**（弹窗期间 App 卡死、定时器停摆）；窗口默认**浮在最前抢焦点**挡住用户操作。
+- 替代实现：`NSPanel(styleMask: [.titled, .closable, .resizable, .utilityWindow, .nonactivatingPanel])`
+  - `level = .normal` + `isFloatingPanel = false` → 不置顶；
+  - `becomesKeyOnlyIfNeeded = true` → 不抢键盘焦点；
+  - `orderFrontRegardless()` → 显示但不 activate App（**关键**：别用 `makeKeyAndOrderFront`）；
+  - `hidesOnDeactivate = false` → App 失活时不自动隐藏，否则用户找不到报错。
+- 正文用 `NSTextView`（`isSelectable = true` / `isEditable = false`）包 `NSScrollView`，才能拖选 + ⌘C。
+- 内存：`isReleasedWhenClosed = false`，并在 `windowWillClose` 回调里移除外部字典引用，避免野指针。
+
+### 43. 以普通用户身份读取 root 属主目录下的标记文件，前提是目录 0755、文件 0644
+App 要判断「用户是否手动锁定过」，办法是 `FileManager.fileExists(atPath: "/var/run/ntfsformac/locked.<dev>")`。
+这**不需要提权**：`/var/run/ntfsformac` 是 `drwxr-xr-x root:daemon`（others 有 r-x），
+标记文件由 root 默认 umask 创建为 `0644`（others 可读）。实测 `fileExists` 返回 `true`。
+- 反例警示：若目录权限收紧为 `0700`，App 就会「看不到标记」从而错误地自动解锁，
+  且**不会报任何错**——排查时极易误判为「App 代码没生效」。
+- 结论：跨权限边界传递状态时，务必确认路径每一级的 others 权限，并优先用「stat 一下」来验证而不是猜。
+
+### 44. macOS 上交互 shell 是 zsh、脚本 shebang 是 bash —— 用 zsh 复现 `read`/`IFS` 行为会得出与运行时相反的结论
+本机 `/bin/zsh`（交互）与 `/bin/bash`（3.2，脚本 shebang）对 `read` 的**行尾空字段**处理不同：
+
+| 输入（IFS='\|'，`read -r a b c d state`） | bash 3.2 | zsh |
+|---|---|---|
+| `a\|b\|c\|d\|ro\|`（尾部空字段） | `ro`（**剥掉尾部分隔符**） | `ro\|`（保留） |
+| `a\|b\|c\|d\|rw\|GUID`（尾字段非空） | `rw\|GUID` | `rw\|GUID` |
+
+- 踩坑经过：排查 #40 时我在交互 shell（zsh）里复现，得到 `state="ro|"`，据此断言「NTFS 自动挂载彻底失效」
+  并写进了文档与代码注释；后来做端到端实验（守护进程实际在 bash 下运行）才发现 NTFS 路径**一直是好的**。
+- 结论：**复现必须与被复现者的 shell 一致**。
+  - 守护进程/测试脚本一律 `/bin/bash` 运行 → 复现也用 `/bin/bash -c` 或把测试写进 `#!/bin/bash` 脚本。
+  - 反之，用 `zsh -c` 复现 bash 脚本的行为，是**无效证据**。
+  - 本项目的测试脚本已显式用 `sudo -n /bin/bash <绝对路径>` 调用，正是为了避免这类歧义。

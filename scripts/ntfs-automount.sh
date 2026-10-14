@@ -45,7 +45,19 @@ while true; do
   done
 
   # 扫描
-  "$NTFSCTL" list --porcelain 2>/dev/null | while IFS='|' read -r dev label fs mp state; do
+  # 字段: device|label|fs|mountpoint|state|guid
+  # read 的最后一个变量会吞下「本行剩余全部」（含分隔符），必须把 6 个字段都声明出来，
+  # 并多留一个 _rest 兜底（以后再加字段也不会重演）。
+  #
+  # 实测（bash 3.2，IFS='|'）：
+  #   5 字段读「disk26s1|AUTOTEST|ntfs|/Volumes/AUTOTEST|ro|」 → state="ro"      ← 尾部空字段被剥掉
+  #   5 字段读「disk4s1|Ventoy|bitlocker|/Volumes/V|rw|4967D63B-…」→ state="rw|4967D63B-…" ← 被污染
+  # 所以 v0.0.12 加 guid 之后的实际影响面是：**NTFS 卷（guid 为空）不受影响**（bash 剥掉尾部空字段），
+  # 只有 **BitLocker 卷（guid 非空）** 的 state 被污染，导致其 rw / ro|none 分支失配
+  # （表现为不清理只读寄生虫、ro/none 时不自动挂载）。
+  # 注意 zsh 的 read 不会剥掉尾部空字段（会得到 "ro|"），调试时若用 zsh 复现会得到与 bash 不同的结论——
+  # 本脚本由 launchd 以 /bin/bash 执行，务必用 bash 复现。
+  "$NTFSCTL" list --porcelain 2>/dev/null | while IFS='|' read -r dev label fs mp state guid _rest; do
     [ -n "$dev" ] || continue
     # eject 中 → 跳过
     [ -e "$MARKER_DIR/ejecting.$dev" ] && continue
