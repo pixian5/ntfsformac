@@ -387,3 +387,19 @@ dd if=/dev/disk4   bs=1 skip=3 count=8   → 8 字节（但缓冲设备在卷已
 - 结论：**字节读 = 扇区对齐 dd + `tail -c`/`head -c` 切片**；不要对裸设备直接用 `bs=1`。
 - 测试注意：把 `dev_read_bytes` 从 ntfsctl 抽出到测试脚本 `eval` 时，同时要抽出它依赖的 `dev_io` 与 `as_root_np`
   （`as_root_np() { "$@"; }` 即可），否则测试里会 `command not found` 假失败。
+
+### 47. `diskutil info` 的 `File System Personality` 在 BitLocker 盘上**不可信**，不能拿它判断密文/明文
+实测（真实 Ventoy 15.1 U 盘，`disk4s1` 为 BitLocker）：
+
+```
+# 即使已锁定、dislocker 已停止、无任何解密层 —— 它照样这么报：
+$ diskutil info disk4s1 | grep -E 'File System|Mounted'
+   Mounted:                   No
+   File System Personality:   ExFAT        ← 假象：盘上其实是 -FVE-FS- 密文
+```
+
+- 原因：该字段是 DiskArbitration 的探测/缓存产物，不反映当前盘上字节的真实形态。
+- **可靠判据**：读首扇区偏移 3 起的 8 字节签名——
+  `-FVE-FS-` → BitLocker；`EXFAT␣␣␣` → exFAT；`NTFS␣␣␣␣` → NTFS（本项目 `ntfsctl probe` 即用此法）。
+- 教训：判断「是否加密」只认签名，别信 `diskutil` 的 personality；也别用「macOS 挂不上」当证据——
+  普通 FAT 分区（0xEF 类型）同样挂不上，见 #44/第六节。
