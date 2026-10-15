@@ -70,5 +70,13 @@ fi
 step "6. 清理"
 hdiutil detach "$DEV" >/dev/null 2>&1 || true
 rm -f "$IMG"
+# 挂载点目录由 ntfs-3g 创建，属 root；若不清理会残留到下次运行，
+# 使 macOS 把同名卷挂成 "AUTOTEST 1"（测试结果会长出误导性的卷名）。
+# 只删「确实没在挂载」的目录，避免误伤正在使用的挂载点。
+for d in "/Volumes/$LABEL" "/Volumes/${LABEL} "*/; do
+  [ -d "$d" ] || continue
+  /sbin/mount 2>/dev/null | grep -qF " on ${d%/} (" && continue
+  rm -rf "${d%/}" 2>/dev/null || true
+done
 printf '\n结果: 通过 %d 项, 失败 %d 项\n' "$PASS" "$FAIL"
 [ "$FAIL" = "0" ] && exit 0 || exit 1

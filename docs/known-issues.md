@@ -358,3 +358,32 @@ App 要判断「用户是否手动锁定过」，办法是 `FileManager.fileExis
   - 守护进程/测试脚本一律 `/bin/bash` 运行 → 复现也用 `/bin/bash -c` 或把测试写进 `#!/bin/bash` 脚本。
   - 反之，用 `zsh -c` 复现 bash 脚本的行为，是**无效证据**。
   - 本项目的测试脚本已显式用 `sudo -n /bin/bash <绝对路径>` 调用，正是为了避免这类歧义。
+
+### 45. 卷**已挂载**时，读 `/dev/diskXsY`（缓冲设备）会 `Resource busy` → 读到 0 字节；必须改用 `/dev/rdiskXsY`（裸设备）
+这是本轮「分区找出来了却显示 unreadable / 挂载失败」的**根因**，也是最隐蔽的一坑：
+
+| 设备节点 | 卷已挂载时读取 | 说明 |
+|---|---|---|
+| `/dev/disk4s1`（缓冲设备，buffered） | `dd: Resource busy` → **0 字节** | 内核块设备层被挂载占用 |
+| `/dev/rdisk4s1`（裸设备，raw） | 正常读出 512 字节 | 绕过缓冲区，直接访盘 |
+
+- 复现：`dd if=/dev/disk4s1 bs=512 count=1` → 0 字节；同一时刻 `dd if=/dev/rdisk4s1 bs=512 count=1` → 512 字节。
+- 后果：`fs_type_of` 读首扇区得空 → 返回 `unreadable` → 挂载前预检把**真 NTFS 盘**当「未知内容」跳过，
+  守护进程不挂（test-automount 由 7/0 变 0/1）。
+- 处理：新增 `dev_io()`，**所有内容读取与整分区导出一律走 `dev_io`**（优先 `/dev/r<dev>`，不存在才回退 `/dev/<dev>`）。
+- 教训：**只在读取卷内容时**要小心；`hdiutil attach`、`mount` 等操作仍必须用原本的 `/dev/diskXsY`。
+
+### 46. 裸设备 `/dev/rdiskN` **只接受扇区对齐读写**——字节粒度读必须「扇区对齐 dd + 切片」
+`/dev/rdiskN` 不接受任意字节偏移/长度的读写：
+
+```
+dd if=/dev/rdisk4  bs=1 skip=3 count=8   → 0 字节（静默失败，不报错）
+dd if=/dev/disk4   bs=1 skip=3 count=8   → 8 字节（但缓冲设备在卷已挂载时 EBUSY，见 #45）
+```
+
+于是 exFAT 卷标（要从根目录某个**非扇区对齐**的字节偏移读）、FAT BPB 字段等字节粒度读取都读不出来。
+- 处理：新增 `dev_read_bytes <dev> <字节偏移> <长度>`——先把偏移向下取整到扇区边界，
+  用扇区对齐的 `dd bs=512 skip=<first> count=<cnt>` 读一段，再用 `tail -c`/`head -c` 切出目标区间。
+- 结论：**字节读 = 扇区对齐 dd + `tail -c`/`head -c` 切片**；不要对裸设备直接用 `bs=1`。
+- 测试注意：把 `dev_read_bytes` 从 ntfsctl 抽出到测试脚本 `eval` 时，同时要抽出它依赖的 `dev_io` 与 `as_root_np`
+  （`as_root_np() { "$@"; }` 即可），否则测试里会 `command not found` 假失败。

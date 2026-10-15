@@ -74,6 +74,9 @@ SUDOERS_TMP=$(mktemp /tmp/ntfsformac.sudoers.XXXXXX)
   # 因此这里用通配符 *，既允许零参数调用也允许带 --device/--password-file 等参数
   printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/scripts/install-service.sh\n' "$OWNER_USER" "$SRC_DIR"
   printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/scripts/uninstall.sh\n' "$OWNER_USER" "$SRC_DIR"
+  # install-driver.sh 的「特权段」（装 FUSE-T pkg / make install）走免密重入，替代原先的
+  # osascript 管理员授权框；通配 * 同时覆盖 --priv pkg / --priv make-install 两种调用形式
+  printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/install-driver.sh*\n' "$OWNER_USER" "$SRC_DIR"
   # 测试脚本用通配 *.sh* 一次放行：既覆盖现有全部测试，也覆盖带参数的调用形式；
   # 好处是新增测试脚本无需再改 sudoers（改 sudoers 本身要 root，会弹授权框，与「零弹窗」冲突）。
   printf '%s ALL=(ALL) NOPASSWD: /bin/bash %s/test/*.sh*\n' "$OWNER_USER" "$SRC_DIR"

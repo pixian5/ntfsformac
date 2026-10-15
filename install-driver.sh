@@ -13,6 +13,53 @@ BUILD_DIR=/tmp/ntfs-3g-fuse-t-build
 log() { printf '[install] %s\n' "$*"; }
 die() { printf '[install] 错误: %s\n' "$*" >&2; exit 1; }
 
+SELF="$ROOT/$(basename "$0")"
+
+# ---------- 特权段：免密执行（绝不弹授权框） ----------
+# 背景：原先两处用 osascript「with administrator privileges」弹管理员授权框，用户要求免密化。
+# 做法：把真正需要 root 的两步（installer 装 pkg、make install）拆成「特权子命令」，
+# 非 root 时以 sudoers 白名单身份免密重入本脚本执行：
+#     <owner> ALL=(ALL) NOPASSWD: /bin/bash <SRC_DIR>/install-driver.sh*
+# 白名单由 scripts/install-service.sh 写入（该脚本本身已免密，所以更新白名单也不弹窗）。
+# 为什么不整脚本重入 root：脚本里的 brew 步骤不能以 root 运行（Homebrew 明确拒绝 root），
+# 构建产物也应归属用户，真正需要 root 的只有最后的安装动作。
+as_root_np() {
+  if [ "$(id -u)" = "0" ]; then "$@"; else sudo -n "$@"; fi
+}
+
+# 特权子命令分发（由免密重入调用；已是 root 时也可直接调用）
+priv_dispatch() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    pkg)
+      [ -n "${1:-}" ] || die "特权子命令 pkg 缺少包路径"
+      log "安装 FUSE-T pkg: $1"
+      /usr/sbin/installer -pkg "$1" -target / || die "FUSE-T pkg 安装失败"
+      ;;
+    make-install)
+      [ -n "${1:-}" ] || die "特权子命令 make-install 缺少构建目录"
+      [ -d "$1" ] || die "构建目录不存在: $1"
+      log "make install（ntfs-3g）: $1"
+      ( cd "$1" && make install ) || die "make install 失败"
+      ;;
+    *) die "未知特权子命令: ${sub:-（空）}" ;;
+  esac
+}
+
+# 免密重入入口：必须放在「环境检查」之前 —— 重入时 root 的 PATH 里通常没有 brew，
+# 若先跑环境检查会被误判为缺 Homebrew 而失败。
+if [ "${1:-}" = "--priv" ]; then
+  shift
+  priv_dispatch "$@"
+  exit 0
+fi
+
+# 免密执行特权步骤；免密不可用时明确失败（绝不转入交互认证，避免弹 Touch ID / 密码框）
+priv() {
+  as_root_np /bin/bash "$SELF" --priv "$@" \
+    || die "特权步骤失败；若提示需要密码，请先运行 scripts/install-service.sh 写入 sudoers 白名单"
+}
+
 # ---------- 环境检查 ----------
 [ "$(uname -m)" = "arm64" ] || die "仅支持 Apple Silicon"
 MAJ=$(sw_vers -productVersion | cut -d. -f1)
@@ -28,8 +75,8 @@ if [ ! -f "$FUSE_T_LIB" ] || [ ! -d "$FUSE_T_SERVER" ]; then
     PKG=$(ls -t /opt/homebrew/Caskroom/fuse-t/*/*.pkg 2>/dev/null | head -1)
     [ -n "$PKG" ] || PKG=$(ls -t /usr/local/Caskroom/fuse-t/*/*.pkg 2>/dev/null | head -1)
     [ -n "$PKG" ] || die "FUSE-T 安装失败：库与 pkg 均未找到，请手动下载 https://github.com/macos-fuse-t/fuse-t/releases 安装"
-    log "手动安装 FUSE-T pkg: ${PKG}（请在弹出的授权框中确认）"
-    osascript -e "do shell script \"installer -pkg '$PKG' -target /\" with administrator privileges" || die "FUSE-T pkg 安装失败"
+    log "手动安装 FUSE-T pkg: ${PKG}（免密提权，不弹授权框）"
+    priv pkg "$PKG"
   fi
 fi
 log "FUSE-T OK: $(ls "$FUSE_T_SERVER"/go-nfsv4-* 2>/dev/null | tail -1)"
@@ -65,8 +112,8 @@ if [ ! -x "$NTFS_3G" ] || ! otool -L "$NTFS_3G" 2>/dev/null | grep -q libfuse-t;
     ./configure --prefix=/usr/local --exec-prefix=/usr/local --with-fuse=external --sbindir=/usr/local/bin --bindir=/usr/local/bin || die "configure 失败"
     make -j"$(sysctl -n hw.ncpu)" || die "make 失败"
   ) || exit 1
-  log "make install（请在弹出的授权框中确认管理员密码）..."
-  osascript -e "do shell script \"cd '$BUILD_DIR' && make install 2>&1\" with administrator privileges" || die "make install 失败"
+  log "make install（免密提权，不弹授权框）..."
+  priv make-install "$BUILD_DIR"
 fi
 
 # ---------- 构建 dislocker（BitLocker 解锁/读写，v0.7.3 + FUSE-T 适配） ----------

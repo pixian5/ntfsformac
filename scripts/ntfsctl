@@ -36,6 +36,36 @@ as_root_np() {
   if [ "$(id -u)" = "0" ]; then "$@"; else sudo -n "$@"; fi
 }
 
+# ---------- 读/导出设备内容一律走「裸设备」 ----------
+# 关键发现（本机实测）：卷**已挂载**时，缓冲设备 /dev/diskXsY 的读取会被内核拒绝
+#   dd: /dev/disk4s1: Resource busy        → 读到 0 字节
+# 而裸设备（raw device，绕过缓冲区）同一时刻读取正常：
+#   dd if=/dev/rdisk4s1 bs=512 count=1     → 读到 512 字节
+# 由于本工具频繁需要在「盘已挂载」的前提下读首扇区（判文件系统、读卷标、判 BitLocker），
+# 因此所有内容读取与整分区导出都必须用 /dev/r<dev>，否则会把已挂载的盘误判成
+# 「unreadable（读不到）」——进而出现「分区明明在、却显示不认识 / 不能挂」的假故障。
+# 极少数设备没有 rdisk 节点时退回缓冲设备。
+dev_io() {
+  if [ -e "/dev/r$1" ]; then printf '/dev/r%s' "$1"; else printf '/dev/%s' "$1"; fi
+}
+
+# 按字节区间读取设备内容（任意偏移/长度都支持）。
+# 为什么不直接 dd bs=1 skip=<字节偏移>：
+#   实测裸设备 /dev/rdiskN **只接受扇区对齐的读写**，`bs=1 skip=3` 会静默返回 0 字节；
+#   而缓冲设备 /dev/diskN 虽支持 bs=1，却会在卷已挂载时 EBUSY。
+# 因此统一策略 = 「先按扇区对齐读，再用 tail/head 切到目标字节区间」，
+# 两种情况下都成立，且不需要判断卷是否挂载。
+# 用法: dev_read_bytes <dev> <字节偏移> <长度>
+dev_read_bytes() {
+  local dev="$1" off="$2" len="$3" bs=512 first delta cnt
+  first=$(( off / bs ))
+  delta=$(( off - first * bs ))
+  cnt=$(( (delta + len + bs - 1) / bs ))
+  [ "$cnt" -ge 1 ] || cnt=1
+  as_root_np dd if="$(dev_io "$dev")" bs=$bs skip="$first" count="$cnt" 2>/dev/null \
+    | tail -c +$((delta + 1)) | head -c "$len"
+}
+
 # 免密重入：非 root 运行「安装版」ntfsctl 时，以 sudo -n 重新调用自身。
 # 只对 $0 == /usr/local/bin/ntfsctl 生效（源码路径不在 sudoers 白名单，重入无意义）；
 # sudo -n 失败（免密不可用）会打印 "a password is required" 并退出 —— 宁可失败也不弹指纹。
@@ -109,11 +139,11 @@ probe_guess() {
 }
 
 probe_one() {
-  local dev="$1" ptype hex sig_hex sig_asc guess
+  local dev="$1" ptype hex sig_hex sig_asc guess sfs label
   ptype=$(diskutil info "/dev/$dev" 2>/dev/null | awk -F': *' '/Partition Type/{print $2; exit}')
   [ -n "$ptype" ] || ptype="(未知)"
   # 一次读出整扇区的十六进制串（经 od 转文本，避免 bash 变量丢失 NUL 字节并刷警告）
-  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  hex=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
   if [ -z "$hex" ]; then
     printf '%s  分区类型=%-14s  无法读取（无读权限、设备不存在或已被独占）\n' "$dev" "$ptype"
     return 1
@@ -121,7 +151,15 @@ probe_one() {
   sig_hex=$(printf '%s' "$hex" | cut -c7-22)
   sig_asc=$(printf '%s' "$sig_hex" | xxd -r -p 2>/dev/null | tr -c '[:print:]' '.')
   guess=$(probe_guess "$hex")
-  printf '%s  分区类型=%-14s 首扇区签名=%s [%s]  → %s\n' "$dev" "$ptype" "$sig_hex" "$sig_asc" "$guess"
+  # 顺带把卷标读出来：macOS 因分区类型拒绝识别文件系统时 diskutil 给不出卷名，
+  # 而「这个分区到底是哪个」往往正是用户要确认的，故直接自己从 BPB / exFAT 根目录读
+  sfs=$(fs_type_of "$dev")
+  label=$(raw_fs_label "$dev" "$sfs")
+  if [ -n "$label" ]; then
+    printf '%s  分区类型=%-14s 首扇区签名=%s [%s]  → %s  卷标=%s\n' "$dev" "$ptype" "$sig_hex" "$sig_asc" "$guess" "$label"
+  else
+    printf '%s  分区类型=%-14s 首扇区签名=%s [%s]  → %s\n' "$dev" "$ptype" "$sig_hex" "$sig_asc" "$guess"
+  fi
 }
 
 # 探测目标：整盘（disk25）则枚举其全部分区；分区（disk25s2）则直接探测
@@ -161,7 +199,7 @@ RAW_DIR=/var/run/ntfsformac/raw-image
 # （与 probe_guess 同源，但这里返回可供程序判断的短名；probe_guess 返回给人看的中文描述）
 fs_type_of() {
   local dev="$1" hex sig t16 t32
-  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  hex=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
   [ -n "$hex" ] || { printf 'unreadable'; return; }
   sig=$(printf '%s' "$hex" | cut -c7-22)
   case "$sig" in
@@ -204,10 +242,57 @@ raw_label() {
     fat12|fat16) off=43 ;;
     *)           return ;;
   esac
-  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  hex=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
   [ -n "$hex" ] || return
   printf '%s' "$hex" | cut -c $((off * 2 + 1))-$(((off + 11) * 2)) \
     | xxd -r -p 2>/dev/null | tr -d '\000' | sed 's/[[:space:]]*$//'
+}
+
+# 从十六进制串偏移 o 处取 4 字节「小端」无符号十进制数（纯字符串运算，bash 3.2 兼容）
+_le4() {
+  local h="$1" o="$2" b
+  b=$(printf '%s' "$h" | cut -c $((o * 2 + 1))-$((o * 2 + 8)))
+  printf '%d' "0x${b:6:2}${b:4:2}${b:2:2}${b:0:2}"
+}
+
+# 读 exFAT 卷标。exFAT 的卷标**不在 BPB 里**（所以 raw_label 拿不到），而在根目录的
+# 「卷标目录项」（条目类型 0x83）中，需要按簇堆参数换算出其字节偏移：
+#   BPB 小端字段：0x58 簇堆偏移(4B)、0x60 根目录首簇号(4B)、0x6C 每扇区字节数位移(1B)、
+#                0x6D 每簇扇区数位移(1B)
+#   字节偏移 = (簇堆偏移 + (根目录首簇号 - 2) × 每簇扇区数) × 每扇区字节数
+# 卷标条目布局：偏移 0 = 类型(0x83)、偏移 2 起 11 个 UTF-16LE 字符
+exfat_label() {
+  local dev="$1" hex heap root bss ssc off t l
+  hex=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+  [ -n "$hex" ] || return
+  heap=$(_le4 "$hex" 88) || return
+  root=$(_le4 "$hex" 96) || return
+  t=$(printf '%s' "$hex" | cut -c217-218); bss=$((16#$t))   # 偏移 108
+  t=$(printf '%s' "$hex" | cut -c219-220); ssc=$((16#$t))   # 偏移 109
+  [ "$root" -ge 2 ] 2>/dev/null || return
+  off=$(( (heap + (root - 2) * (1 << ssc)) * (1 << bss) ))
+  [ "$off" -gt 0 ] 2>/dev/null || return
+  # 只认卷标条目（类型 0x83=131），避免把其它目录项误当卷标
+  # 注意用 dev_read_bytes 而非 dd bs=1：裸设备不支持字节粒度读（见其注释）
+  t=$(dev_read_bytes "$dev" "$off" 1 | od -An -tu1 | tr -d ' ')
+  [ "$t" = "131" ] || return
+  l=$(dev_read_bytes "$dev" "$((off + 2))" 22 \
+      | iconv -f UTF-16LE -t UTF-8 2>/dev/null | tr -d '\000')
+  printf '%s' "$l" | sed 's/[[:space:]]*$//'
+}
+
+# 按文件系统类型读卷标（FAT 家族走 BPB；exFAT 走根目录卷标条目）
+raw_fs_label() {
+  local dev="$1" fs="$2" l
+  case "$fs" in
+    exfat) printf '%s' "$(exfat_label "$dev")" ;;
+    fat)
+      # 'fat' 表示「MSWIN4.1 但 BPB 没给出类型串」，无法确定是 FAT12/16 还是 FAT32：
+      # 两个偏移都试，取非空的那个
+      l=$(raw_label "$dev" fat32); [ -n "$l" ] || l=$(raw_label "$dev" fat16)
+      printf '%s' "$l" ;;
+    *) printf '%s' "$(raw_label "$dev" "$fs")" ;;
+  esac
 }
 
 # 外置盘上的「其它分区」：输出 dev|label|fs。
@@ -229,14 +314,40 @@ other_devices() {
     [ -e "/dev/$dev" ] || continue
     case "$ntfs_list" in *" $dev "*) continue ;; esac          # ① NTFS/BitLocker 已单独展示
     /sbin/mount 2>/dev/null | grep -qF "/dev/$dev on " && continue  # ② 已被原生挂载
+    # MSWIN4.1 歧义签名：可能是 BitLocker-To-Go，交给 BitLocker 链路处理（同样的消歧逻辑）
+    is_bitlocker "$dev" && continue
     fs=$(fs_type_of "$dev")
     case "$fs" in
-      fat12|fat16|fat32|exfat) ;;                              # ③ 只收 FAT 家族
+      fat12|fat16|fat32|exfat|fat) ;;                          # ③ 只收 FAT 家族
       *) continue ;;
     esac
-    label=$(raw_label "$dev" "$fs")
+    label=$(raw_fs_label "$dev" "$fs")
     [ -n "$label" ] || label="$fs-$dev"
     printf '%s|%s|%s\n' "$dev" "$label" "$fs"
+  done
+}
+
+# 清理「失效的只读镜像」：拔盘却没 eject 时，RAW_DIR 会残留记录与临时镜像文件。
+# 判定标准 = 原设备节点已不存在（盘真的走了）。由 list 调用（App 每 3 秒一次的心跳点）。
+prune_raw_images() {
+  local rec d idev
+  [ -d "$RAW_DIR" ] || return 0
+  for rec in "$RAW_DIR"/disk*; do
+    [ -e "$rec" ] || continue
+    d="${rec##*/}"
+    case "$d" in *.img) continue ;; esac        # 记录文件，跳过镜像本体
+    [ -e "/dev/$d" ] && continue                # 原设备还在 → 记录有效，保留
+    idev=$(cat "$rec" 2>/dev/null)
+    [ -n "$idev" ] && { as_root_np hdiutil detach "/dev/$idev" -force >/dev/null 2>&1 || true; }
+    as_root_np rm -f "$rec" >/dev/null 2>&1 || true
+    as_root_np rm -f "$RAW_DIR/$d.img" >/dev/null 2>&1 || true
+    trace "raw: 已清理失效镜像记录 $d"
+  done
+  # 孤儿镜像文件（记录已丢但文件还在，且原设备不存在）
+  for rec in "$RAW_DIR"/*.img; do
+    [ -e "$rec" ] || continue
+    d="${rec##*/}"; d="${d%.img}"
+    [ -e "/dev/$d" ] || as_root_np rm -f "$rec" >/dev/null 2>&1 || true
   done
 }
 
@@ -260,14 +371,25 @@ raw_mount_one() {
   lock_mount || die "另一个挂载/解锁操作进行中，请稍后再试"
   trap 'unlock_mount' EXIT
   mp=$(raw_mp "$dev")
-  [ -n "$mp" ] && { log "/dev/${dev} 已挂载（${mp}），跳过"; unlock_mount; trap - EXIT; return 0; }
+  if [ -n "$mp" ]; then
+    log "/dev/${dev} 已挂载只读副本（${mp}），跳过"; unlock_mount; trap - EXIT; return 0
+  fi
+  # macOS 若已能原生挂载该分区（分区类型被识别），就直接用它，不必再绕只读副本：
+  # 否则会出现「同一内容挂两份」（原生 + 副本），用户会看到两个同名卷（如 VTOYEFI / VTOYEFI 1）
+  mp=$(mountpoint_of "$dev" "$(raw_fs_label "$dev" "$fs")")
+  if [ -n "$mp" ]; then
+    log "/dev/${dev} 已由 macOS 原生挂载于 ${mp}，直接用该挂载点（不建只读副本）"
+    unlock_mount; trap - EXIT; return 0
+  fi
   raw_detach_one "$dev"        # 清掉上次可能没摘干净的旧镜像设备，避免叠加挂两份
   owner=$(resolve_owner); [ -n "$owner" ] || owner=$(id -un)
   as_root mkdir -p "$RAW_DIR" 2>/dev/null || true
   img="$RAW_DIR/${dev}.img"
   as_root rm -f "$img" 2>/dev/null || true
   # 导出分区内容（只读拷贝，33MB 级实测约 1.4 秒）
-  as_root_np dd if="/dev/$dev" of="$img" bs=1m 2>/dev/null || die "导出 /dev/$dev 内容失败"
+  # 导出必须走裸设备：卷若已被 macOS 原生挂载，缓冲设备会 Resource busy 直接失败；
+  # 且裸设备是顺序读、无缓冲开销，大分区导出更快
+  as_root_np dd if="$(dev_io "$dev")" of="$img" bs=1m 2>/dev/null || die "导出 /dev/${dev} 内容失败"
   # 镜像交给 GUI 属主，这样后续以属主身份附加、挂载点归属该用户（否则普通用户访问不了 700 权限的卷）
   as_root chown "$owner" "$img" 2>/dev/null || true
   as_root chmod 600 "$img" 2>/dev/null || true
@@ -429,14 +551,33 @@ BL_CONTAINER_DIR=/var/run/ntfsformac/bl
 # 需 root 才能读裸设备；读不到一律按「非 BitLocker」处理
 is_bitlocker() {
   local dev="$1" sig
-  # 只读首扇区 11 字节再取偏移 3 起的 8 字节（扇区对齐，兼容 macOS 裸设备）
+  # 只读首扇区 11 字节再取偏移 3 起的 8 字节。**必须用裸设备**：
+  # 卷已挂载时缓冲设备 /dev/diskXsY 会 Resource busy（读到 0 字节），rdisk 正常。
   # 有读权限就直接读（如用户自己附加的磁盘镜像）；否则走免密提权（真实物理盘），
   # 用 sudo -n 保证绝不弹密码框：无权限时静默失败，按「非 BitLocker」处理
   sig=""
-  [ -r "/dev/$dev" ] && sig=$(dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
-  [ -n "$sig" ] || sig=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  [ -r "/dev/r$dev" ] && sig=$(dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  [ -n "$sig" ] || sig=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
   case "$sig" in
-    "-FVE-FS-"|"MSWIN4.1") return 0 ;;
+    "-FVE-FS-") return 0 ;;
+    "MSWIN4.1")
+      # 歧义签名：**Windows 格式化的 FAT32/FAT16 也写 MSWIN4.1**，仅凭签名会把普通 FAT 盘
+      # 误判成「BitLocker 加密未解锁」——用户看到的就是「分区找出来了却不能挂、不能用」。
+      # 两级消歧（实测 dislocker-metadata 对真 BitLocker 返回 0，对 MSWIN4.1 的 FAT32 返回 1）：
+      #   ① BPB 里有明确 FAT 类型串（FAT12/16/32）→ 就是普通 FAT 盘；
+      #   ② 否则问 dislocker 能否解析出 BitLocker 卷头（读元数据**不需要凭据**，加密盘也能读）
+      local h t
+      h=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | od -An -tx1 -v | tr -d ' \n')
+      if [ -n "$h" ]; then
+        t=$(printf '%s' "$h" | cut -c165-180 | xxd -r -p 2>/dev/null)
+        case "$t" in FAT32*) return 1 ;; esac
+        t=$(printf '%s' "$h" | cut -c109-124 | xxd -r -p 2>/dev/null)
+        case "$t" in FAT12*|FAT16*) return 1 ;; esac
+      fi
+      # 注意：dislocker-metadata 把日志打到 **stdout**，必须整段接住再判断，不能泄漏到调用方
+      as_root_np dislocker-metadata -V "/dev/$dev" >/dev/null 2>&1 && return 0
+      return 1
+      ;;
     *) return 1 ;;
   esac
 }
@@ -453,15 +594,16 @@ is_bitlocker() {
 bl_guid() {
   local dev="$1" sig hex skip
   sig=""
-  [ -r "/dev/$dev" ] && sig=$(dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
-  [ -n "$sig" ] || sig=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  # 同样必须走裸设备：卷已挂载时缓冲设备会 Resource busy（详见 dev_io 注释）
+  [ -r "/dev/r$dev" ] && sig=$(dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
+  [ -n "$sig" ] || sig=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null | head -c 11 | tail -c 8)
   case "$sig" in
     "-FVE-FS-") skip=161 ;;   # 偏移 0xa0 = 160，从第 161 字节起
     "MSWIN4.1") skip=425 ;;   # 偏移 0x1a8 = 424，从第 425 字节起
     *) return ;;
   esac
-  # 用管道把原始字节直接送 od（不经过 shell 变量，避免 NUL 字节被丢弃）
-  hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null \
+  # 用管道把原始字节直接送 od（不经过 shell 变量，避免 NUL 字节被丢弃）；裸设备优先
+  hex=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null \
         | tail -c +"$skip" | head -c 16 | od -An -tx1 -v | tr -d ' \n' | tr 'a-f' 'A-F')
   [ ${#hex} -eq 32 ] || return
   # 还原 Windows GUID 的混合端序：前 4/2/2 字节组内反转，后 8 字节保序
@@ -791,6 +933,26 @@ mount_one() {
   local dev="$1" label owner uid gid ident parent mp line
   ident="$dev"
 
+  # ---- 挂载前预检：分区类型匹配 ≠ 内容可挂 ----
+  # ntfs_devices 靠分区类型（Windows_NTFS / Microsoft Basic Data）挑选候选，但 Windows 上
+  # 用 exFAT/FAT32 格式化的分区也常是 Microsoft Basic Data，内容却完全不是 NTFS ——
+  # 此时若直接交给 ntfs-3g 必然失败（用户看到「分区找出来了却不能挂、不能用」）。
+  # 故先读首扇区判定内容：FAT 家族改走只读镜像路径（副本），其它未知内容如实告知。
+  if ! is_bitlocker "$dev"; then
+    case "$(fs_type_of "$dev")" in
+      ntfs) ;;
+      exfat|fat12|fat16|fat32|fat)
+        trace "raw: $dev 内容是 FAT 家族（分区类型却是 NTFS/Basic Data），改走只读镜像路径"
+        raw_mount_one "$dev"
+        return 0
+        ;;
+      *)
+        log "/dev/${dev} 的内容既不是 NTFS 也不是已知 FAT 家族，无法挂载（可用 ntfsctl probe ${dev} 查看详情）"
+        return 0
+        ;;
+    esac
+  fi
+
   # ---- BitLocker 加密卷分支 ----
   # 未解锁则跳过（自动挂载不猜密码，等菜单栏/CLI 解锁）；已解锁则挂载解密卷
   if is_bitlocker "$dev"; then
@@ -854,8 +1016,12 @@ mount_one() {
   # 若按「读不到也跳过」处理，只读抢占将永远无法纠正（实测 test-automount.sh 会因此失败）。
   # 说明：用 od 取十六进制串比对，不经 shell 变量承载原始字节——
   # 非 NTFS 分区该处常含 NUL 字节，bash 命令替换会丢弃它们并刷警告。
+  # 【v0.0.16 修正】此前注释误以为「裸设备读取会因 EBUSY 失败」，实测恰好相反：
+  #   已挂载时失败的是**缓冲设备** /dev/diskXsY（Resource busy），而**裸设备** /dev/rdiskXsY 正常。
+  #   改用 dev_io 后本预检在「卷已被 FSKit 只读挂载」时也能正常读到签名，
+  #   于是「读不到就继续挂」这条兜底的必要性下降（但保留，作为极端情况的保险）。
   local fsig_hex
-  fsig_hex=$(as_root_np dd if="/dev/$dev" bs=512 count=1 2>/dev/null \
+  fsig_hex=$(as_root_np dd if="$(dev_io "$dev")" bs=512 count=1 2>/dev/null \
              | head -c 11 | tail -c 8 | od -An -tx1 -v | tr -d ' \n')
   if [ -n "$fsig_hex" ] && [ "$fsig_hex" != "4e54465320202020" ]; then
     log "跳过 ${dev}：首扇区签名非 NTFS（hex=${fsig_hex}），不做无效挂载"
@@ -954,13 +1120,20 @@ unmount_competitors() {
 # ---------- 卸载 ----------
 unmount_one() {
   local dev="$1" label mp
-  # 「其它分区」（非 NTFS/BitLocker）走只读裸镜像路径：卸载 = 摘挂载 + 摘镜像设备 + 删临时镜像
+  # 「其它分区」（非 NTFS/BitLocker 的 FAT 家族）可能是两种挂载状态之一：
+  #   ① 我们附加的只读镜像（有 raw 记录）→ 摘下镜像即完成卸载；
+  #   ② macOS 原生挂载（该分区类型被识别时）→ 落到下面的通用卸载逻辑。
   if is_raw_partition "$dev"; then
-    raw_detach_one "$dev"
-    log "已卸载（其它分区只读副本）: $dev"
-    return 0
+    mp=$(raw_mp "$dev")
+    if [ -n "$mp" ]; then
+      raw_detach_one "$dev"
+      log "已卸载（其它分区只读副本）: ${dev} ← ${mp}"
+      return 0
+    fi
+    label=$(label_of "$dev")
+  else
+    if is_bitlocker "$dev"; then label=$(bl_label "$dev"); else label=$(label_of "$dev"); fi
   fi
-  if is_bitlocker "$dev"; then label=$(bl_label "$dev"); else label=$(label_of "$dev"); fi
   mp=$(mountpoint_of "$dev" "$label")
   if [ -z "$mp" ]; then log "未挂载: $dev"; return 0; fi
   # 置挂起标记，防止 daemon 60s 内自动重挂（尊重手动卸载意图）
@@ -992,10 +1165,9 @@ eject_one() {
   lock_mount || die "另一个挂载/卸载操作进行中，请稍后再试"
   trap 'unlock_mount' EXIT
 
-  # 0. 先摘下「其它分区」的只读镜像：本设备自己的那份 + 同父盘其它分区的那份。
-  #    必须赶在 diskutil eject 父盘之前，否则镜像设备会残留成「幽灵磁盘」。
-  #    （raw_detach_* 不再单独取锁，此处已持锁，避免自锁死。）
-  is_raw_partition "$dev" || raw_detach_one "$dev"
+  # 0. 先摘下本盘（含同父盘其它分区）的只读镜像。必须赶在 diskutil eject 父盘之前，
+  #    否则镜像设备会残留成「幽灵磁盘」（磁盘工具里多出指向已消失数据的盘）。
+  #    raw_detach_one 不单独取锁（此处已持锁，避免自锁死）。
   raw_detach_parent "$parent"
 
   # 1. eject marker（防 daemon 立即重挂）
@@ -1070,12 +1242,15 @@ case "$CMD" in
     # 顺手清理失效的「手动锁定」标记（设备已拔走 / 超期）。
     # list 由菜单栏 App 每 3 秒以 root 调用一次，是现成的心跳点，不必再依赖守护进程是否存活。
     prune_locked_markers
-    # 输出: device|label|<fs:ntfs|bitlocker>|mountpoint|<state:rw|ro|none|locked>|guid
+    # 顺手清理失效的「只读镜像」记录（拔盘未 eject 时残留），同理挂在 list 心跳点上
+    prune_raw_images
+    # 输出: device|label|<fs>|mountpoint|<state:rw|ro|none|locked>|guid
     # guid 仅 BitLocker 卷有（用于 App 侧做「跨插拔稳定的钥匙串键」）；非 BitLocker 为空
     ntfs_devices | while IFS=' ' read -r dev label; do
       [ -n "$dev" ] || continue
-      fs=ntfs
       guid=""
+      # 先判 BitLocker（必须排在内容归类之前：MSWIN4.1 是 FAT 与 BitLocker-To-Go 的歧义签名，
+      # is_bitlocker 内部已用「BPB 类型串 + dislocker-metadata」两级消歧）
       if is_bitlocker "$dev"; then
         fs=bitlocker
         guid=$(bl_guid "$dev")
@@ -1089,8 +1264,31 @@ case "$CMD" in
           mp=""
         fi
       else
-        st=$(mount_state "$dev" "$label")
-        mp=$(mountpoint_of "$dev" "$label")
+        # 分区类型匹配（Windows_NTFS / Microsoft Basic Data）**不等于**内容就是 NTFS：
+        # 实测 Windows 上用 exFAT/FAT32 格式化的分区，分区类型同样常是 Microsoft Basic Data，
+        # 此时若一律当 NTFS 去挂，ntfs-3g 必然失败——这正是「分区找出来了却不能用」的场景。
+        # 故按首扇区内容归并：ntfs → 读写挂载；FAT 家族 → 只读镜像路径；其它 → 如实标注
+        cfs=$(fs_type_of "$dev")
+        case "$cfs" in
+          exfat|fat12|fat16|fat32|fat)
+            fs="$cfs"
+            label=$(raw_fs_label "$dev" "$fs")
+            [ -n "$label" ] || label="$fs-$dev"
+            # 优先看我们附加的只读镜像；否则看 macOS 是否已原生挂载
+            mp=$(raw_mp "$dev")
+            if [ -n "$mp" ]; then
+              st=ro
+            else
+              mp=$(mountpoint_of "$dev" "$label")
+              if [ -n "$mp" ]; then st=$(mount_state "$dev" "$label"); else st=none; fi
+            fi
+            ;;
+          *)
+            fs="$cfs"
+            st=$(mount_state "$dev" "$label")
+            mp=$(mountpoint_of "$dev" "$label")
+            ;;
+        esac
       fi
       if [ -n "$PORCELAIN" ]; then
         printf '%s|%s|%s|%s|%s|%s\n' "$dev" "$label" "$fs" "$mp" "$st" "$guid"

@@ -46,10 +46,10 @@ macOS 13 起移除了系统内置 NTFS 写入支持；macOS 26 上苹果的 FSKi
 ## 安装
 
 ```bash
-# 1. 安装驱动（FUSE-T + ntfs-3g 源码构建，需要一次管理员密码）
+# 1. 安装驱动（FUSE-T + ntfs-3g 源码构建，已免密化，不再弹管理员授权框）
 bash install-driver.sh
 
-# 2. 构建并安装菜单栏 App + 自动挂载服务（需要一次管理员密码）
+# 2. 构建并安装菜单栏 App + 自动挂载服务（已免密化）
 bash build-app.sh
 ```
 
@@ -92,7 +92,7 @@ ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.15）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
+菜单栏 App（v0.0.16）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
 
 v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
 导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
@@ -127,11 +127,24 @@ v0.0.15 解决两件事：
    免密不可用直接失败），并新增「裸跑免密重入」——终端直接跑 `ntfsctl ...` 自动经白名单提权，
    实测 list/mount/unmount 全链路零弹窗。
 
-详情见 [docs/20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md)。
+v0.0.16 **根治「多分区有的找不出来、找出来了不能用」**，并**免密化驱动安装**：
+① 两个隐蔽根因（详见 [known-issues.md](docs/known-issues.md) #45/#46）：
+   - 卷**已挂载**时读 `/dev/diskXsY`（缓冲设备）会 `Resource busy` → 0 字节，导致真 NTFS 盘被误判 unreadable；
+     → 所有内容读取/整分区导出改走 `/dev/rdiskXsY`（裸设备，新增 `dev_io()`）。
+   - 裸设备**只接受扇区对齐读** → exFAT 卷标（非对齐偏移）读不出；新增 `dev_read_bytes()`（扇区对齐 dd + 切片）。
+② **分区类型与内容解耦**：分区类型同为 `Microsoft Basic Data`，内容却可能是 exFAT/FAT32；
+   一律按首扇区内容归并，FAT 家族自动走只读裸镜像路径，未知内容明确提示用 `ntfsctl probe` 查看。
+③ **`MSWIN4.1` 消歧**：FAT 家族与 BitLocker-To-Go 共用该 OEM 名；用 FAT 类型串 + `dislocker-metadata` 二次判定，
+   FAT32 不再被误判成加密盘。
+④ 新增 exFAT 卷标解析（读根目录 0x83 卷标条目）、`prune_raw_images()` 失效镜像记录清理。
+⑤ **install-driver.sh 免密化**：原先两处 `osascript ... with administrator privileges` 管理员授权框
+   改为「特权子命令 + `sudo -n` 免密重入」，实测以普通用户运行零弹窗（详见 `scripts/install-service.sh` 白名单）。
+
+详情见 [docs/20261015-2108-多分区找不到不能用根治与驱动免密-DeepSeek-V4.1-Flash.md](docs/20261015-2108-多分区找不到不能用根治与驱动免密-DeepSeek-V4.1-Flash.md)。
 
 ## 下一步待实现
 
-install-driver.sh 免密化、大分区镜像挂载的体积/耗时提示、ext4 浏览、ErrorPanel 保存到文件等。
+大分区镜像挂载的体积/耗时提示、ext4 浏览、ErrorPanel 保存到文件等。
 
 详情见 [docs/20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md)。
 
@@ -157,6 +170,7 @@ install-driver.sh 免密化、大分区镜像挂载的体积/耗时提示、ext4
 | [20261015-0045-报错弹窗重构与手动锁定标记-DeepSeek-V4.1-Flash.md](docs/20261015-0045-报错弹窗重构与手动锁定标记-DeepSeek-V4.1-Flash.md) | 报错弹窗改可复制非阻塞 NSPanel + eject 互斥锁 + 手动锁定标记（含竞态修正）+ porcelain 6 字段回归 |
 | [20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md](docs/20261014-2145-恢复密码与BEK解锁入口-DeepSeek-V4.1-Flash.md) | 恢复密码 / .BEK 文件解锁入口（含 dislocker 55 字符铁律） |
 | [20261015-0745-其它分区检测与只读镜像挂载-DeepSeek-V4.1-Flash.md](docs/20261015-0745-其它分区检测与只读镜像挂载-DeepSeek-V4.1-Flash.md) | 其它分区（VTOYEFI 等）检测与只读裸镜像挂载 + 根除 Touch ID 指纹弹窗（免密重入） |
+| [20261015-2108-多分区找不到不能用根治与驱动免密-DeepSeek-V4.1-Flash.md](docs/20261015-2108-多分区找不到不能用根治与驱动免密-DeepSeek-V4.1-Flash.md) | 多分区「找不到/不能用」根治（裸设备读取 + 分区类型与内容解耦 + MSWIN4.1 消歧 + exFAT 卷标）+ 驱动安装免密化 |
 | [20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261015-0745-当前开发进度-DeepSeek-V4.1-Flash.md) | 最新里程碑完成情况与功能清单 |
 | [20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md](docs/20261015-0745-下一步待实现-DeepSeek-V4.1-Flash.md) | 后续开发计划 |
 | [20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md](docs/20261014-2116-当前开发进度-DeepSeek-V4.1-Flash.md) | 历史里程碑（v0.0.12 阶段） |
