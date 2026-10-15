@@ -725,6 +725,42 @@ bl_detach_inner() {
   trace "bl: 已摘下镜像设备 $idev"
 }
 
+# 清理「失效的 BitLocker 容器与镜像记录」：拔盘（原设备节点消失）后残留的
+#   BL_IMAGE_DIR/<dev>   —— 记录「解密卷附加成的镜像设备」，内容形如 disk24
+#   BL_CONTAINER_DIR/<dev> —— dislocker-fuse 的容器目录（内含 dislocker-file）
+# 判定与 prune_raw_images 一致：原设备节点 /dev/<dev> 已不存在即视为失效。
+# 为什么需要：盘号会漂移（上轮 disk25s1、本轮 disk4s1），而这两个目录没有随设备消失自动清理，
+# 多次插拔会在不同盘号下累积空目录/旧记录；且 BL_IMAGE_DIR 的旧记录还会被 ntfs_devices 的
+# 「排除镜像设备」逻辑读走，制造排查噪音。挂在 list 心跳点执行（App 每 3 秒以 root 调用）。
+prune_bl_dirs() {
+  local rec d dev idev
+  # 1) 镜像记录：原设备没了 → 摘掉可能仍附加的镜像设备 + 删记录
+  if [ -d "$BL_IMAGE_DIR" ]; then
+    for rec in "$BL_IMAGE_DIR"/disk*; do
+      [ -e "$rec" ] || continue
+      dev="${rec##*/}"
+      [ -e "/dev/$dev" ] && continue                    # 原设备还在 → 记录有效，保留
+      idev=$(cat "$rec" 2>/dev/null)
+      [ -n "$idev" ] && as_root hdiutil detach "/dev/$idev" -force >/dev/null 2>&1 || true
+      as_root rm -f "$rec" >/dev/null 2>&1 || true
+      # 走 stderr：list --porcelain 的 stdout 必须只有数据行
+      printf '[ntfsctl] 清理失效的 BitLocker 镜像记录: %s（设备已不存在）\n' "$dev" >&2
+    done
+  fi
+  # 2) 容器目录：仅当原设备已不存在、且该容器已不在挂载表中才删。
+  #    仍挂在挂载表里（残留 NFS 挂载）就先不动，交给正常 unmount/lock 流程，避免硬拆风险。
+  if [ -d "$BL_CONTAINER_DIR" ]; then
+    for d in "$BL_CONTAINER_DIR"/*; do
+      [ -e "$d" ] || continue
+      dev="${d##*/}"
+      [ -e "/dev/$dev" ] && continue                    # 原设备还在 → 保留
+      [ -n "$(bl_container_mp "$dev")" ] && continue    # 容器仍处于挂载态 → 保留
+      as_root rm -rf "$d" >/dev/null 2>&1 || true
+      printf '[ntfsctl] 清理失效的 BitLocker 容器目录: %s（设备已不存在）\n' "$dev" >&2
+    done
+  fi
+}
+
 # 读取解密卷的真实卷标（未解锁读不到，回退 BitLocker-<dev>）
 # NTFS 内层可读 ntfslabel；exFAT 引导扇区不含卷标，只能从镜像挂载点反推
 bl_label() {
@@ -1244,6 +1280,8 @@ case "$CMD" in
     prune_locked_markers
     # 顺手清理失效的「只读镜像」记录（拔盘未 eject 时残留），同理挂在 list 心跳点上
     prune_raw_images
+    # 顺手清理失效的「BitLocker 容器目录 / 镜像记录」（拔盘后盘号漂移会累积残留），同理
+    prune_bl_dirs
     # 输出: device|label|<fs>|mountpoint|<state:rw|ro|none|locked>|guid
     # guid 仅 BitLocker 卷有（用于 App 侧做「跨插拔稳定的钥匙串键」）；非 BitLocker 为空
     ntfs_devices | while IFS=' ' read -r dev label; do

@@ -135,6 +135,22 @@ touch "$RAW_DIR/$LIVE"; printf 'disk96' > "$RAW_DIR/$LIVE"
                               || bad "有效记录被误删（会给在用挂载造成麻烦）"
 rm -f "$RAW_DIR/$LIVE"; hdiutil detach "$DEV" >/dev/null 2>&1 || true; rm -f "$IMG"
 
+step "7b. 失效 BitLocker 容器/镜像记录的自动清理（拔盘后盘号漂移的残留）"
+# (a) 失效：记录/容器对应的设备节点不存在 → 都应被 prune_bl_dirs 清掉
+touch /var/run/ntfsformac/bl-image/disk99s9
+printf 'disk98' > /var/run/ntfsformac/bl-image/disk99s9
+mkdir -p /var/run/ntfsformac/bl/disk99s9
+# (b) 有效：记录指向「真实存在的设备」→ 必须保留（不能误删在用挂载的容器/记录）
+rm -f "$IMG"; dd if=/dev/zero of="$IMG" bs=1m count=64 >/dev/null 2>&1
+DEV=$(attach_raw); LIVE="${DEV#/dev/}"
+touch "/var/run/ntfsformac/bl-image/$LIVE"; printf 'disk96' > "/var/run/ntfsformac/bl-image/$LIVE"
+"$NTFSCTL" list --porcelain >/dev/null 2>&1
+[ -e /var/run/ntfsformac/bl-image/disk99s9 ] && bad "失效 BitLocker 镜像记录未清理" || ok "失效镜像记录已清理（bl-image）"
+[ -e /var/run/ntfsformac/bl/disk99s9 ]       && bad "失效 BitLocker 容器目录未清理" || ok "失效容器目录已清理（bl）"
+[ -e "/var/run/ntfsformac/bl-image/$LIVE" ]  && ok "设备仍在的记录被保留（${LIVE}，未误删）" \
+                                             || bad "有效记录被误删（会影响在用挂载）"
+rm -f "/var/run/ntfsformac/bl-image/$LIVE"; hdiutil detach "$DEV" >/dev/null 2>&1 || true; rm -f "$IMG"
+
 step "8. 清理测试镜像"
 cleanup_all
 ok "清理完成"

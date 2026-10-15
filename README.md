@@ -92,7 +92,7 @@ ntfsctl dump disk4s1       # 导出卷头与元数据副本原始字节（离线
 ## 当前开发进度
 
 NTFS 与 **BitLocker** 核心功能已全部完成并验证：驱动安装（含 dislocker）、ntfsctl CLI、自动挂载守护进程、
-菜单栏 App（v0.0.16）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
+菜单栏 App（v0.0.17）、BitLocker 三种凭据（用户密码 / 恢复密码 / .BEK 文件）解锁 + 读写 + 锁定 + 钥匙串自动解锁。
 
 v0.0.10 修复了真实 U 盘上的 dislocker 解析缺陷（**未知 value_type 的 datum 会中断整个元数据遍历**，
 导致其后的 FVEK 与 VIRTUALIZATION_INFO 读不到、解锁报 `Unable to compute regions`），
@@ -141,6 +141,11 @@ v0.0.16 **根治「多分区有的找不出来、找出来了不能用」**，�
    改为「特权子命令 + `sudo -n` 免密重入」，实测以普通用户运行零弹窗（详见 `scripts/install-service.sh` 白名单）。
 
 详情见 [docs/20261015-2108-多分区找不到不能用根治与驱动免密-DeepSeek-V4.1-Flash.md](docs/20261015-2108-多分区找不到不能用根治与驱动免密-DeepSeek-V4.1-Flash.md)。
+
+v0.0.17 补齐真盘复验中发现的一处非致命残留：`/var/run/ntfsformac/bl/` 与 `bl-image/`
+（BitLocker 容器目录 + 镜像记录）在设备消失后不自动清理，盘号漂移会累积空目录/旧记录。
+新增 `prune_bl_dirs()` 挂在 `list` 心跳点，按「原设备节点是否还存在」清理，保守起见容器仍处于
+挂载态时不硬拆。真实场景已验证：上一轮残留 `disk25s1` 被自动清掉，在用的 `disk4s1` 完整保留。
 
 ## 下一步待实现
 
