@@ -302,14 +302,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let manualLocked = disk.state == "locked" && isManuallyLocked(disk)
         // 「其它分区」：非 NTFS/BitLocker 的外置分区（如 Ventoy 的 VTOYEFI）。
         // 这类分区 macOS 因分区类型拒绝挂载，ntfsctl 改走「只读裸镜像」路径（挂的是内容副本，
-        // 写入不回写原盘），语义与普通盘的读写挂载不同，菜单需区别对待。
+        // 只能看不能写），语义与普通盘的读写挂载不同，菜单需区别对待并明示限制。
         let isOther = disk.fs != "ntfs" && disk.fs != "bitlocker"
         let tag: String
         if isOther {
             switch disk.state {
-            case "ro":  tag = "○ 只读已挂载"
+            case "ro":  tag = "○ 只读已挂载·不能写入"
             case "rw":  tag = "● RW"                 // 理论上不会出现（其它分区只读）
-            default:    tag = "○ 只读副本·未挂载"
+            default:    tag = "○ 只读·不能写入"
             }
         } else {
             switch disk.state {
@@ -324,14 +324,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let sub = NSMenu()
 
         if isOther {
-            // 其它分区只提供「只读浏览」：说明这是副本，写入不回写原盘
-            let hint = NSMenuItem(title: "只读浏览：导出为免分区表镜像后挂载，写入不回写原盘",
+            // 其它分区只提供「只读浏览」。菜单里把限制写死说透，避免用户误以为可以写入：
+            // 挂的是分区内容的副本，且 macOS 拒绝以可写方式挂载该类型分区。
+            let hint = NSMenuItem(title: "⚠️ 只读模式：只能查看/复制出文件，不能写入（尝试写入会被拒绝）",
                                   action: nil, keyEquivalent: "")
             hint.isEnabled = false
             sub.addItem(hint)
+            let why = NSMenuItem(title: "原因：macOS 不允许此分区类型可写挂载；改类型会让 U 盘无法 UEFI 启动",
+                                 action: nil, keyEquivalent: "")
+            why.isEnabled = false
+            sub.addItem(why)
             sub.addItem(.separator())
             if disk.state != "ro" && disk.state != "rw" {
-                let mount = NSMenuItem(title: "只读挂载（浏览副本）",
+                let mount = NSMenuItem(title: "只读挂载（只能看，不能写）",
                                        action: #selector(actionMount(_:)), keyEquivalent: "")
                 mount.target = self
                 mount.representedObject = disk
